@@ -6,6 +6,26 @@ This changelog is based on the git history from `2026-03-21` (initial commit) th
 
 ---
 
+## 0.1.16 — 2026-06-09
+
+### Added
+
+- **`link_compact` tool — ask another terminal to compact its context window and wait until it finishes.** A fourth LLM tool alongside `link_send`, `link_prompt`, and `link_list`. The call blocks until the target reports compaction complete, so an orchestrator can immediately dispatch follow-up work to a freshly trimmed worker without sleeping or polling. Busy targets (mid-turn or already compacting) decline instead of being interrupted; self-targets are rejected with a pointer to `/compact`; unknown targets resolve immediately as `not_found`; the call times out after 180 seconds. Compact several workers at once via parallel tool calls. Adds `compact_request` / `compact_response` wire messages, both hub-forwarded with an authoritative `from`.
+
+### Changed
+
+- **`/link-name` now collapses internal whitespace.** Leading and trailing whitespace is stripped, and runs of internal whitespace collapse to a single space. `/link-name "build   lead"` saves and shows as `build lead`. Startup names (`--link-name`), saved-name load, saved-name comparison, and the `/link-name` command all normalize identically via a shared `normalizeName()` helper — so a saved name with stray spaces compares equal to its trimmed/collapsed form and won't trigger a redundant append on resume.
+
+### Fixed
+
+- **Hub no longer broadcasts spurious `terminal_left` for already-removed clients.** The hub's WebSocket close handler now looks up the client in live hub state instead of a closure variable captured at register time. If the socket has no live entry — a duplicate or post-removal close event (e.g. a close firing after the error handler's own `close()`) — it's ignored. Previously this could produce phantom "X left" notifications and drift `connectedTerminals` between hub and clients.
+
+### Internal
+
+- **Behavior-identical refactors.** Shared helpers (`targetNotFound`, `renderIconResult`, `latestCustomData`) extracted to remove duplication across tool execute/render paths and session-entry scans. `pushStatus()` skips the `captureContext()` call on no-op pushes. `CompactResponseMsg.reason` comment updated to include `"unsupported"`. No user-visible behavior change.
+
+---
+
 ## 0.1.15 — 2026-05-18
 
 Stable release for the 0.1.15 cycle, promoted after beta soak.

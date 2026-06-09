@@ -6,7 +6,7 @@
  * First terminal to connect becomes the hub; others join as clients.
  * Hub loss triggers automatic promotion of a surviving client.
  *
- * Tools: link_send, link_prompt, link_list
+ * Tools: link_send, link_prompt, link_list, link_compact
  * Commands: /link, /link-name, /link-broadcast, /link-connect, /link-disconnect
  */
 
@@ -26,6 +26,7 @@ import { WebSocket, WebSocketServer } from "ws";
 const DEFAULT_PORT = 9900;
 const PROMPT_INACTIVITY_MS = 90_000;
 const PROMPT_HARD_CEILING_MS = 1_800_000;
+const COMPACT_TIMEOUT_MS = 180_000;
 const RECONNECT_DELAY_MS = 2000;
 const KEEPALIVE_INTERVAL_MS = 30_000;
 const FLUSH_DELAY_MS = 200;
@@ -39,6 +40,7 @@ interface RegisterMsg {
   type: "register";
   name: string;
   cwd?: string;
+  context?: ContextSnapshot;
 }
 interface WelcomeMsg {
   type: "welcome";
@@ -46,12 +48,14 @@ interface WelcomeMsg {
   terminals: string[];
   statuses?: Record<string, LinkStatus>;
   cwds?: Record<string, string>;
+  contexts?: Record<string, ContextSnapshot>;
 }
 interface TerminalJoinedMsg {
   type: "terminal_joined";
   name: string;
   terminals: string[];
   cwd?: string;
+  context?: ContextSnapshot;
 }
 interface TerminalLeftMsg {
   type: "terminal_left";
@@ -84,16 +88,36 @@ interface StatusUpdateMsg {
   type: "status_update";
   name: string;
   status: LinkStatus;
+  // Per-terminal LLM context. Absent = old terminal (ignore); null = clear
+  // stored value; object = store. Only status_update carries the null-clear.
+  context?: ContextSnapshot | null;
 }
 interface ErrorMsg {
   type: "error";
   message: string;
+}
+interface CompactRequestMsg {
+  type: "compact_request";
+  id: string;
+  from: string;
+  to: string;
+  instructions?: string;
+}
+interface CompactResponseMsg {
+  type: "compact_response";
+  id: string;
+  from: string;
+  to: string;
+  ok: boolean;
+  reason?: string; // "busy" | "not_found" | "unsupported" | error text; absent on success
 }
 
 type LinkStatus =
   | { kind: "idle"; since: number }
   | { kind: "thinking"; since: number }
   | { kind: "tool"; toolName: string; since: number };
+
+type ContextSnapshot = { tokens: number | null; contextWindow: number };
 
 type LinkMessage =
   | RegisterMsg
@@ -104,7 +128,9 @@ type LinkMessage =
   | PromptRequestMsg
   | PromptResponseMsg
   | StatusUpdateMsg
-  | ErrorMsg;
+  | ErrorMsg
+  | CompactRequestMsg
+  | CompactResponseMsg;
 
 // ─── Extension ───────────────────────────────────────────────────────────────
 
@@ -138,11 +164,13 @@ export default function (pi: ExtensionAPI) {
 
   // Status tracking (local truth)
   let agentRunning = false;
+  let compactRunning = false; // true while compacting for a remote request
   let activeToolName: string | null = null;
   let stateSince = Date.now();
   let lastPushedKind: string | null = null;
   let lastPushedTool: string | null = null;
   const terminalStatuses = new Map<string, LinkStatus>(); // other terminals
+  const terminalContexts = new Map<string, ContextSnapshot>(); // other terminals' context
   let currentCwd = "";
   const terminalCwds = new Map<string, string>(); // other terminals' cwds
 
@@ -150,6 +178,7 @@ export default function (pi: ExtensionAPI) {
   let wss: WebSocketServer | null = null;
   const hubClients = new Map<WebSocket, string>(); // ws → terminal name
   const hubTerminalStatuses = new Map<string, LinkStatus>(); // hub-authoritative
+  const hubTerminalContexts = new Map<string, ContextSnapshot>(); // hub-authoritative
   const hubTerminalCwds = new Map<string, string>(); // hub-authoritative (excludes self)
 
   // Client state
@@ -166,6 +195,19 @@ export default function (pi: ExtensionAPI) {
       targetName: string;
       inactivityTimeout: ReturnType<typeof setTimeout>;
       ceilingTimeout: ReturnType<typeof setTimeout>;
+    }
+  >();
+
+  // Pending compact responses (sender waiting for remote compaction to finish)
+  const pendingCompactResponses = new Map<
+    string,
+    {
+      resolve: (result: {
+        content: { type: "text"; text: string }[];
+        details: Record<string, unknown>;
+      }) => void;
+      targetName: string;
+      timeout: ReturnType<typeof setTimeout>;
     }
   >();
 
@@ -215,6 +257,15 @@ export default function (pi: ExtensionAPI) {
     return { kind: "idle", since: stateSince };
   }
 
+  function captureContext(): ContextSnapshot | undefined {
+    if (!ctx) return undefined;
+    if (typeof ctx.getContextUsage !== "function") return undefined; // older Pi
+    const usage = ctx.getContextUsage();
+    if (!usage) return undefined;
+    if (usage.contextWindow <= 0) return undefined; // no real context to report
+    return { tokens: usage.tokens, contextWindow: usage.contextWindow };
+  }
+
   function pushStatus(force = false) {
     if (role === "disconnected") return;
     const status = deriveStatus();
@@ -224,16 +275,42 @@ export default function (pi: ExtensionAPI) {
       return;
     lastPushedKind = newKind;
     lastPushedTool = newTool;
+    const context = captureContext(); // only when we actually push
     const msg: StatusUpdateMsg = {
       type: "status_update",
       name: terminalName,
       status,
+      context: context ?? null, // explicit null tells peers to clear
     };
     if (role === "hub") {
       hubBroadcast(msg, terminalName);
     } else if (ws?.readyState === WebSocket.OPEN) {
       ws.send(JSON.stringify(msg));
     }
+  }
+
+  // Canonicalize a link/session name: trim + collapse internal whitespace.
+  // Returns undefined for nullish/blank so callers can fall through precedence.
+  function normalizeName(name: string | undefined | null): string | undefined {
+    const n = name?.trim().replace(/\s+/g, " ");
+    return n ? n : undefined;
+  }
+
+  // Latest custom session entry of a given type (last-write-wins), or undefined.
+  function latestCustomData(
+    customType: string,
+  ): Record<string, unknown> | undefined {
+    if (!ctx) return undefined;
+    const entries = ctx.sessionManager.getEntries();
+    for (let i = entries.length - 1; i >= 0; i--) {
+      const e = entries[i] as {
+        type: string;
+        customType?: string;
+        data?: Record<string, unknown>;
+      };
+      if (e.type === "custom" && e.customType === customType) return e.data;
+    }
+    return undefined;
   }
 
   function formatDuration(since: number): string {
@@ -249,6 +326,20 @@ export default function (pi: ExtensionAPI) {
     return `${s.kind} (${dur})`;
   }
 
+  function formatTokens(n: number): string {
+    if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`;
+    if (n >= 1_000) return `${Math.round(n / 1000)}K`;
+    return `${n}`;
+  }
+
+  function formatContext(c: ContextSnapshot | null | undefined): string {
+    if (!c || c.contextWindow <= 0) return ""; // guard against bad wire data
+    const window = formatTokens(c.contextWindow);
+    if (c.tokens === null) return `?/${window}`;
+    const percent = Math.round((c.tokens / c.contextWindow) * 100);
+    return `${formatTokens(c.tokens)}/${window} (${percent}%)`;
+  }
+
   function getStatusFor(name: string): LinkStatus | null {
     if (name === terminalName) return deriveStatus();
     const map = role === "hub" ? hubTerminalStatuses : terminalStatuses;
@@ -259,6 +350,12 @@ export default function (pi: ExtensionAPI) {
     if (name === terminalName) return currentCwd || null;
     if (role === "hub") return hubTerminalCwds.get(name) ?? null;
     return terminalCwds.get(name) ?? null;
+  }
+
+  function getContextFor(name: string): ContextSnapshot | null {
+    if (name === terminalName) return captureContext() ?? null;
+    if (role === "hub") return hubTerminalContexts.get(name) ?? null;
+    return terminalContexts.get(name) ?? null;
   }
 
   function shortenPath(cwd: string): string {
@@ -337,14 +434,10 @@ export default function (pi: ExtensionAPI) {
   // ── Connection intent ──────────────────────────────────────────────────
 
   function shouldConnect(_ctx: ExtensionContext): boolean {
-    const saved = _ctx.sessionManager
-      .getEntries()
-      .filter(
-        (e: { type: string; customType?: string }) =>
-          e.type === "custom" && e.customType === "link-active",
-      )
-      .pop() as { data?: { active?: boolean } } | undefined;
-    if (saved?.data?.active !== undefined) return saved.data.active;
+    const data = latestCustomData("link-active") as
+      | { active?: boolean }
+      | undefined;
+    if (data?.active !== undefined) return data.active;
     return pi.getFlag("link") === true;
   }
 
@@ -356,6 +449,14 @@ export default function (pi: ExtensionAPI) {
     clearTimeout(pending.inactivityTimeout);
     clearTimeout(pending.ceilingTimeout);
     pendingPromptResponses.delete(requestId);
+    return pending;
+  }
+
+  function cleanupPendingCompact(requestId: string) {
+    const pending = pendingCompactResponses.get(requestId);
+    if (!pending) return null;
+    clearTimeout(pending.timeout);
+    pendingCompactResponses.delete(requestId);
     return pending;
   }
 
@@ -436,7 +537,12 @@ export default function (pi: ExtensionAPI) {
    * still reject via protocol-level error responses).
    */
   function routeMessage(
-    msg: ChatMsg | PromptRequestMsg | PromptResponseMsg,
+    msg:
+      | ChatMsg
+      | PromptRequestMsg
+      | PromptResponseMsg
+      | CompactRequestMsg
+      | CompactResponseMsg,
   ): boolean {
     if (role === "hub") {
       if (msg.to === "*") {
@@ -464,13 +570,26 @@ export default function (pi: ExtensionAPI) {
               response: "",
               error: errText,
             }
-          : { type: "error", message: errText };
+          : msg.type === "compact_request"
+            ? {
+                type: "compact_response",
+                id: msg.id,
+                from: terminalName,
+                to: msg.from,
+                ok: false,
+                reason: "not_found",
+              }
+            : { type: "error", message: errText };
 
       if (msg.from === terminalName) {
-        // For prompt_request, deliver the error response locally so
-        // pendingPromptResponses resolves. For chat, skip — the tool
-        // result (via return false) is sufficient; no extra UI toast.
-        if (errorMsg.type === "prompt_response") handleIncoming(errorMsg);
+        // For prompt_request/compact_request, deliver the error response
+        // locally so the matching pending map resolves. For chat, skip — the
+        // tool result (via return false) is sufficient; no extra UI toast.
+        if (
+          errorMsg.type === "prompt_response" ||
+          errorMsg.type === "compact_response"
+        )
+          handleIncoming(errorMsg);
       } else {
         hubClientByName(msg.from)?.send(JSON.stringify(errorMsg));
       }
@@ -494,6 +613,7 @@ export default function (pi: ExtensionAPI) {
         connectedTerminals = msg.terminals;
         terminalStatuses.clear();
         terminalCwds.clear();
+        terminalContexts.clear();
         if (msg.statuses) {
           for (const [name, status] of Object.entries(msg.statuses)) {
             terminalStatuses.set(name, status);
@@ -502,6 +622,11 @@ export default function (pi: ExtensionAPI) {
         if (msg.cwds) {
           for (const [name, cwd] of Object.entries(msg.cwds)) {
             terminalCwds.set(name, cwd);
+          }
+        }
+        if (msg.contexts) {
+          for (const [name, c] of Object.entries(msg.contexts)) {
+            terminalContexts.set(name, c);
           }
         }
         updateStatus();
@@ -516,6 +641,8 @@ export default function (pi: ExtensionAPI) {
       case "terminal_joined":
         connectedTerminals = msg.terminals;
         if (role !== "hub" && msg.cwd) terminalCwds.set(msg.name, msg.cwd);
+        if (role !== "hub" && msg.context)
+          terminalContexts.set(msg.name, msg.context);
         updateStatus();
         notify(`"${msg.name}" joined the link`, "info");
         break;
@@ -523,11 +650,27 @@ export default function (pi: ExtensionAPI) {
       case "terminal_left":
         connectedTerminals = msg.terminals;
         terminalStatuses.delete(msg.name);
-        if (role !== "hub") terminalCwds.delete(msg.name);
-        // Fail any pending prompts to the departed terminal immediately
+        if (role !== "hub") {
+          terminalCwds.delete(msg.name);
+          terminalContexts.delete(msg.name);
+        }
+        // Fail any pending prompts/compacts to the departed terminal
         for (const [id, pending] of pendingPromptResponses) {
           if (pending.targetName === msg.name) {
             const p = cleanupPending(id);
+            if (p) {
+              p.resolve(
+                textResult(`Terminal "${msg.name}" disconnected`, {
+                  to: msg.name,
+                  error: "disconnected",
+                }),
+              );
+            }
+          }
+        }
+        for (const [id, pending] of pendingCompactResponses) {
+          if (pending.targetName === msg.name) {
+            const p = cleanupPendingCompact(id);
             if (p) {
               p.resolve(
                 textResult(`Terminal "${msg.name}" disconnected`, {
@@ -545,6 +688,8 @@ export default function (pi: ExtensionAPI) {
       // ── Status update from another terminal ──
       case "status_update":
         terminalStatuses.set(msg.name, msg.status);
+        if (msg.context) terminalContexts.set(msg.name, msg.context);
+        else if (msg.context === null) terminalContexts.delete(msg.name);
         resetInactivityFor(msg.name);
         break;
 
@@ -566,9 +711,60 @@ export default function (pi: ExtensionAPI) {
         }
         break;
 
+      // ── Another terminal asks us to compact our context ──
+      case "compact_request": {
+        if (agentRunning || pendingRemotePrompt || compactRunning) {
+          routeMessage({
+            type: "compact_response",
+            id: msg.id,
+            from: terminalName,
+            to: msg.from,
+            ok: false,
+            reason: "busy",
+          });
+          break;
+        }
+        const { id, from } = msg;
+        let finished = false;
+        const finish = (ok: boolean, reason?: string) => {
+          if (finished) return;
+          finished = true;
+          compactRunning = false;
+          routeMessage({
+            type: "compact_response",
+            id,
+            from: terminalName,
+            to: from,
+            ok,
+            reason,
+          });
+        };
+        if (!ctx?.compact) {
+          finish(false, "unsupported");
+          break;
+        }
+        compactRunning = true;
+        notify(`"${from}" requested compact`, "info");
+        // compact() aborts the current turn first, so the busy guard above
+        // keeps us from interrupting active work. The runtime guarantees
+        // exactly one of onComplete/onError fires, so compactRunning can't
+        // get stuck and the sender won't hang.
+        try {
+          ctx.compact({
+            customInstructions: msg.instructions,
+            onComplete: () => finish(true),
+            onError: (e) =>
+              finish(false, e instanceof Error ? e.message : String(e)),
+          });
+        } catch (e) {
+          finish(false, e instanceof Error ? e.message : String(e));
+        }
+        break;
+      }
+
       // ── Another terminal asks us to run a prompt ──
       case "prompt_request":
-        if (agentRunning || pendingRemotePrompt) {
+        if (agentRunning || pendingRemotePrompt || compactRunning) {
           routeMessage({
             type: "prompt_response",
             id: msg.id,
@@ -610,6 +806,30 @@ export default function (pi: ExtensionAPI) {
         break;
       }
 
+      // ── Response to a compact we requested ──
+      case "compact_response": {
+        const pending = cleanupPendingCompact(msg.id);
+        if (pending) {
+          // Use the requested target, not msg.from: a hub-synthesized
+          // not_found response comes from the hub, not the worker.
+          const target = pending.targetName;
+          if (msg.ok) {
+            pending.resolve(
+              textResult(`Compacted "${target}"`, { to: target }),
+            );
+          } else {
+            const reason = msg.reason ?? "failed";
+            pending.resolve(
+              textResult(`Compact on "${target}" not done: ${reason}`, {
+                to: target,
+                error: reason,
+              }),
+            );
+          }
+        }
+        break;
+      }
+
       case "error":
         notify(`Link: ${msg.message}`, "error");
         break;
@@ -631,6 +851,7 @@ export default function (pi: ExtensionAPI) {
         clientName = uniqueName(msg.name);
         hubClients.set(clientWs, clientName);
         if (msg.cwd) hubTerminalCwds.set(clientName, msg.cwd);
+        if (msg.context) hubTerminalContexts.set(clientName, msg.context);
         const list = terminalList();
         connectedTerminals = list;
         updateStatus();
@@ -646,6 +867,12 @@ export default function (pi: ExtensionAPI) {
         for (const [name, cwd] of hubTerminalCwds) {
           if (name !== clientName) cwds[name] = cwd;
         }
+        const contexts: Record<string, ContextSnapshot> = {};
+        const hubContext = captureContext();
+        if (hubContext) contexts[terminalName] = hubContext; // hub's own context
+        for (const [name, c] of hubTerminalContexts) {
+          if (name !== clientName) contexts[name] = c;
+        }
         clientWs.send(
           JSON.stringify({
             type: "welcome",
@@ -653,15 +880,17 @@ export default function (pi: ExtensionAPI) {
             terminals: list,
             statuses,
             cwds,
+            contexts,
           } satisfies WelcomeMsg),
         );
 
-        // Notify everyone else (include joiner's cwd)
+        // Notify everyone else (include joiner's cwd + context)
         const joined: TerminalJoinedMsg = {
           type: "terminal_joined",
           name: clientName,
           terminals: list,
           cwd: msg.cwd,
+          context: msg.context,
         };
         hubBroadcast(joined, clientName);
         return;
@@ -673,11 +902,14 @@ export default function (pi: ExtensionAPI) {
       // Status update — store and fan out to other clients only (not back to hub)
       if (msg.type === "status_update") {
         hubTerminalStatuses.set(clientName, msg.status);
+        if (msg.context) hubTerminalContexts.set(clientName, msg.context);
+        else if (msg.context === null) hubTerminalContexts.delete(clientName);
         resetInactivityFor(clientName);
         const normalized: StatusUpdateMsg = {
           type: "status_update",
           name: clientName,
           status: msg.status,
+          context: msg.context, // undefined omitted by JSON; null forwarded to clear
         };
         const json = JSON.stringify(normalized);
         for (const [otherWs, name] of hubClients) {
@@ -692,7 +924,9 @@ export default function (pi: ExtensionAPI) {
       if (
         msg.type === "chat" ||
         msg.type === "prompt_request" ||
-        msg.type === "prompt_response"
+        msg.type === "prompt_response" ||
+        msg.type === "compact_request" ||
+        msg.type === "compact_response"
       ) {
         routeMessage({ ...msg, from: clientName });
       }
@@ -700,20 +934,21 @@ export default function (pi: ExtensionAPI) {
 
     clientWs.on("close", () => {
       if (disposed) return;
-      if (clientName) {
-        hubClients.delete(clientWs);
-        hubTerminalStatuses.delete(clientName);
-        hubTerminalCwds.delete(clientName);
-        const list = terminalList();
-        connectedTerminals = list;
-        updateStatus();
-        const left: TerminalLeftMsg = {
-          type: "terminal_left",
-          name: clientName,
-          terminals: list,
-        };
-        hubBroadcast(left, clientName);
-      }
+      const name = hubClients.get(clientWs);
+      if (!name) return; // already removed (e.g. via disconnect) — ignore stale event
+      hubClients.delete(clientWs);
+      hubTerminalStatuses.delete(name);
+      hubTerminalContexts.delete(name);
+      hubTerminalCwds.delete(name);
+      const list = terminalList();
+      connectedTerminals = list;
+      updateStatus();
+      const left: TerminalLeftMsg = {
+        type: "terminal_left",
+        name,
+        terminals: list,
+      };
+      hubBroadcast(left, name);
     });
 
     clientWs.on("error", () => {
@@ -793,6 +1028,7 @@ export default function (pi: ExtensionAPI) {
             type: "register",
             name: preferredName ?? terminalName,
             cwd: currentCwd || undefined,
+            context: captureContext(),
           } satisfies RegisterMsg),
         );
         resolve(true);
@@ -869,10 +1105,19 @@ export default function (pi: ExtensionAPI) {
       keepaliveTimer = null;
     }
     pendingRemotePrompt = null;
+    compactRunning = false;
 
-    // Clean up pending prompts
+    // Clean up pending prompts and compacts
     for (const id of [...pendingPromptResponses.keys()]) {
       const pending = cleanupPending(id);
+      if (pending) {
+        pending.resolve(
+          textResult("Link disconnected", { error: "disconnected" }),
+        );
+      }
+    }
+    for (const id of [...pendingCompactResponses.keys()]) {
+      const pending = cleanupPendingCompact(id);
       if (pending) {
         pending.resolve(
           textResult("Link disconnected", { error: "disconnected" }),
@@ -898,6 +1143,8 @@ export default function (pi: ExtensionAPI) {
     connectedTerminals = [];
     terminalStatuses.clear();
     hubTerminalStatuses.clear();
+    terminalContexts.clear();
+    hubTerminalContexts.clear();
     terminalCwds.clear();
     hubTerminalCwds.clear();
     lastPushedKind = null;
@@ -943,7 +1190,7 @@ export default function (pi: ExtensionAPI) {
     const cliRaw = pi.getFlag("link-name");
     let cliFlagName: string | undefined;
     if (typeof cliRaw === "string") {
-      cliFlagName = cliRaw.trim().replace(/\s+/g, " ");
+      cliFlagName = normalizeName(cliRaw);
       if (!cliFlagName) {
         console.error("Error: --link-name requires a non-empty value.");
         process.exit(1);
@@ -952,7 +1199,7 @@ export default function (pi: ExtensionAPI) {
 
     const envRaw = process.env.PI_LINK_NAME;
     delete process.env.PI_LINK_NAME;
-    const envFlagName = envRaw?.trim().replace(/\s+/g, " ") || undefined;
+    const envFlagName = normalizeName(envRaw);
 
     const flagName = cliFlagName ?? envFlagName;
     const fromEnv = !cliFlagName && !!envFlagName;
@@ -964,19 +1211,12 @@ export default function (pi: ExtensionAPI) {
       // Skip append if the saved name already matches; persistence is needed
       // only for first-time set or actual change. Reduces session-file growth
       // on repeated startups (common in automation).
-      let latestSaved: string | undefined;
-      const entries = _ctx.sessionManager.getEntries();
-      for (let i = entries.length - 1; i >= 0; i--) {
-        const e = entries[i] as {
-          type: string;
-          customType?: string;
-          data?: { name?: unknown };
-        };
-        if (e.type !== "custom" || e.customType !== "link-name") continue;
-        if (typeof e.data?.name === "string") latestSaved = e.data.name;
-        break;
-      }
-      if (latestSaved?.trim().replace(/\s+/g, " ") !== flagName) {
+      const latest = latestCustomData("link-name") as
+        | { name?: unknown }
+        | undefined;
+      const latestSaved =
+        typeof latest?.name === "string" ? latest.name : undefined;
+      if (normalizeName(latestSaved) !== flagName) {
         pi.appendEntry("link-name", { name: flagName });
       }
 
@@ -984,18 +1224,15 @@ export default function (pi: ExtensionAPI) {
       // Public --link-name is link-only.
       if (fromEnv && !pi.getSessionName()) pi.setSessionName(flagName);
     } else {
-      const saved = _ctx.sessionManager
-        .getEntries()
-        .filter(
-          (e: { type: string; customType?: string }) =>
-            e.type === "custom" && e.customType === "link-name",
-        )
-        .pop() as { data?: { name?: string } } | undefined;
-      if (saved?.data?.name) {
-        preferredName = saved.data.name;
+      const saved = latestCustomData("link-name") as
+        | { name?: string }
+        | undefined;
+      const savedName = normalizeName(saved?.name);
+      if (savedName) {
+        preferredName = savedName;
         terminalName = preferredName;
       } else {
-        const sessionName = pi.getSessionName()?.trim().replace(/\s+/g, " ");
+        const sessionName = normalizeName(pi.getSessionName());
         if (sessionName) terminalName = sessionName;
       }
     }
@@ -1012,6 +1249,11 @@ export default function (pi: ExtensionAPI) {
     activeToolName = null;
     stateSince = Date.now();
     pushStatus();
+  });
+
+  pi.on("session_compact", async () => {
+    // Tokens just dropped sharply — force a push so peers see the new context.
+    pushStatus(true);
   });
 
   pi.on("tool_execution_start", async (event) => {
@@ -1082,6 +1324,30 @@ export default function (pi: ExtensionAPI) {
     return text.length > max ? text.slice(0, max) + "..." : text;
   }
 
+  // Shared "target not found" result for the send/prompt/compact tools.
+  // Returns null when the target is present, so callers can `if (miss) return miss;`.
+  function targetNotFound(to: string) {
+    return connectedTerminals.includes(to)
+      ? null
+      : textResult(
+          `Terminal "${to}" not found. Connected: ${connectedTerminals.join(", ")}`,
+          { to, error: "not_found" },
+        );
+  }
+
+  // Shared ✓/✗ result renderer for link_send and link_compact.
+  function renderIconResult(
+    result: { content: { type: string; text?: string }[]; details?: unknown },
+    theme: { fg(role: string, text: string): string },
+  ) {
+    const txt = result.content[0];
+    const details = result.details as Record<string, unknown> | undefined;
+    const icon = details?.error
+      ? theme.fg("error", "✗ ")
+      : theme.fg("success", "✓ ");
+    return new Text(icon + (txt?.type === "text" ? txt.text : ""), 0, 0);
+  }
+
   // ── Tools ────────────────────────────────────────────────────────────────
 
   pi.registerTool({
@@ -1110,11 +1376,9 @@ export default function (pi: ExtensionAPI) {
       if (role === "disconnected") return notConnectedResult();
 
       // Pre-validate target exists locally (best-effort, catches typos and definitely-absent names)
-      if (params.to !== "*" && !connectedTerminals.includes(params.to)) {
-        return textResult(
-          `Terminal "${params.to}" not found. Connected: ${connectedTerminals.join(", ")}`,
-          { to: params.to, error: "not_found" },
-        );
+      if (params.to !== "*") {
+        const miss = targetNotFound(params.to);
+        if (miss) return miss;
       }
 
       const delivered = routeMessage({
@@ -1153,14 +1417,108 @@ export default function (pi: ExtensionAPI) {
       return new Text(text, 0, 0);
     },
 
-    renderResult(result, _options, theme) {
-      const txt = result.content[0];
-      const details = result.details as Record<string, unknown> | undefined;
-      const icon = details?.error
-        ? theme.fg("error", "✗ ")
-        : theme.fg("success", "✓ ");
-      return new Text(icon + (txt?.type === "text" ? txt.text : ""), 0, 0);
+    renderResult: (result, _options, theme) => renderIconResult(result, theme),
+  });
+
+  pi.registerTool({
+    name: "link_compact",
+    label: "Link Compact",
+    description: [
+      "Ask another Pi terminal to compact its context window and wait until it finishes.",
+      "Returns once the target has compacted, so you can immediately send it new work.",
+      "Busy targets (mid-turn or already compacting) decline; retry when idle.",
+    ].join(" "),
+    promptSnippet: "Ask another Pi terminal to compact its context window",
+    parameters: Type.Object({
+      to: Type.String({ description: "Target terminal name" }),
+      instructions: Type.Optional(
+        Type.String({
+          description: "Optional custom compaction instructions for the target",
+        }),
+      ),
+    }),
+
+    async execute(_toolCallId, params, signal) {
+      if (role === "disconnected") return notConnectedResult();
+
+      if (params.to === terminalName) {
+        return textResult("Cannot compact yourself - use /compact.", {
+          to: params.to,
+          error: "self_target",
+        });
+      }
+
+      const miss = targetNotFound(params.to);
+      if (miss) return miss;
+
+      const requestId = crypto.randomUUID();
+
+      return new Promise((resolve) => {
+        const timeout = setTimeout(() => {
+          const pending = cleanupPendingCompact(requestId);
+          if (pending) {
+            pending.resolve(
+              textResult(
+                `Compact request to "${params.to}" timed out (${COMPACT_TIMEOUT_MS / 1000}s)`,
+                { to: params.to, error: "timeout" },
+              ),
+            );
+          }
+        }, COMPACT_TIMEOUT_MS);
+
+        pendingCompactResponses.set(requestId, {
+          resolve,
+          targetName: params.to,
+          timeout,
+        });
+
+        signal?.addEventListener(
+          "abort",
+          () => {
+            const pending = cleanupPendingCompact(requestId);
+            if (pending) {
+              pending.resolve(
+                textResult("Compact request aborted", {
+                  to: params.to,
+                  error: "aborted",
+                }),
+              );
+            }
+          },
+          { once: true },
+        );
+
+        const delivered = routeMessage({
+          type: "compact_request",
+          id: requestId,
+          from: terminalName,
+          to: params.to,
+          instructions: params.instructions,
+        });
+
+        if (!delivered && pendingCompactResponses.has(requestId)) {
+          const pending = cleanupPendingCompact(requestId);
+          if (pending) {
+            pending.resolve(
+              textResult(`Failed to request compact on "${params.to}"`, {
+                to: params.to,
+                error: "not_delivered",
+              }),
+            );
+          }
+        }
+      });
     },
+
+    renderCall(args, theme) {
+      let text = theme.fg("toolTitle", theme.bold("link_compact "));
+      text += theme.fg("accent", String(args.to));
+      if (typeof args.instructions === "string")
+        text += "\n  " + theme.fg("dim", truncatePreview(args.instructions));
+      return new Text(text, 0, 0);
+    },
+
+    renderResult: (result, _options, theme) => renderIconResult(result, theme),
   });
 
   pi.registerTool({
@@ -1188,12 +1546,8 @@ export default function (pi: ExtensionAPI) {
         });
       }
 
-      if (!connectedTerminals.includes(params.to)) {
-        return textResult(
-          `Terminal "${params.to}" not found. Connected: ${connectedTerminals.join(", ")}`,
-          { to: params.to, error: "not_found" },
-        );
-      }
+      const miss = targetNotFound(params.to);
+      if (miss) return miss;
 
       const requestId = crypto.randomUUID();
 
@@ -1302,6 +1656,7 @@ export default function (pi: ExtensionAPI) {
 
       const statuses: Record<string, string> = {};
       const cwds: Record<string, string> = {};
+      const contexts: Record<string, ContextSnapshot> = {};
       const list = connectedTerminals
         .map((name) => {
           const status = getStatusFor(name);
@@ -1309,8 +1664,12 @@ export default function (pi: ExtensionAPI) {
           if (statusStr) statuses[name] = statusStr;
           const cwd = getCwdFor(name);
           if (cwd) cwds[name] = cwd;
+          const context = getContextFor(name);
+          if (context) contexts[name] = context;
+          const ctxStr = formatContext(context);
           const marker = name === terminalName ? " (you)" : "";
           let line = `  \u2022 ${name}${marker}${statusStr ? "  " + statusStr : ""}`;
+          if (ctxStr) line += `  \u00b7 ${ctxStr}`;
           if (cwd) line += `\n    cwd: ${cwd}`;
           return line;
         })
@@ -1320,6 +1679,7 @@ export default function (pi: ExtensionAPI) {
         terminals: connectedTerminals,
         statuses,
         cwds,
+        contexts,
         self: terminalName,
         role,
       });
@@ -1331,6 +1691,7 @@ export default function (pi: ExtensionAPI) {
             terminals?: string[];
             statuses?: Record<string, string>;
             cwds?: Record<string, string>;
+            contexts?: Record<string, ContextSnapshot>;
             self?: string;
             role?: string;
           }
@@ -1347,11 +1708,13 @@ export default function (pi: ExtensionAPI) {
         const isSelf = name === details.self;
         const status = details.statuses?.[name] ?? "";
         const cwd = details.cwds?.[name];
+        const ctxStr = formatContext(details.contexts?.[name]);
         const nameStr = isSelf ? `\u2022 ${name} (you)` : `\u2022 ${name}`;
         text +=
           "\n  " +
           (isSelf ? theme.fg("accent", nameStr) : theme.fg("text", nameStr)) +
-          (status ? "  " + theme.fg("dim", status) : "");
+          (status ? "  " + theme.fg("dim", status) : "") +
+          (ctxStr ? theme.fg("dim", "  \u00b7 " + ctxStr) : "");
         if (cwd) text += "\n    " + theme.fg("dim", `cwd: ${shortenPath(cwd)}`);
       }
       return new Text(text, 0, 0);
@@ -1371,8 +1734,10 @@ export default function (pi: ExtensionAPI) {
         const status = getStatusFor(name);
         const statusStr = status ? formatStatus(status) : "";
         const cwd = getCwdFor(name);
+        const ctxStr = formatContext(getContextFor(name));
         const marker = name === terminalName ? " (you)" : "";
         let line = `${name}${marker}${statusStr ? ": " + statusStr : ""}`;
+        if (ctxStr) line += ` \u00b7 ${ctxStr}`;
         if (cwd) line += `\n  cwd: ${shortenPath(cwd)}`;
         return line;
       });
@@ -1386,10 +1751,10 @@ export default function (pi: ExtensionAPI) {
   pi.registerCommand("link-name", {
     description: "Change link name. No arg = use session name",
     handler: async (args, _ctx) => {
-      let newName = args.trim();
+      let newName = normalizeName(args) ?? "";
       if (!newName) {
         // No argument: use session name if available
-        const sessionName = pi.getSessionName()?.trim().replace(/\s+/g, " ");
+        const sessionName = normalizeName(pi.getSessionName());
         if (sessionName) {
           newName = sessionName;
         } else {
@@ -1444,6 +1809,7 @@ export default function (pi: ExtensionAPI) {
             name: newName,
             terminals: list,
             cwd: currentCwd,
+            context: captureContext(),
           },
           terminalName,
         );

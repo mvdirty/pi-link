@@ -2,7 +2,7 @@
 
 A WebSocket-based inter-terminal communication system that creates a local network between multiple Pi coding agent terminals. Enables terminals to discover each other, exchange messages, and orchestrate work across agents - all automatically on `localhost`.
 
-> Self-contained TypeScript in a single `index.ts` file. Start Pi with `--link` to enable, or use `pi-link <name>` to resume/create named sessions
+> Three patterns out of the box: ask another agent for an answer (`link_prompt`), delegate async work (`link_send` with `triggerTurn:true`), or broadcast to every other terminal (`/link-broadcast`). Start two Pi terminals with `--link` — they find each other automatically.
 
 ---
 
@@ -67,9 +67,7 @@ Or install both in one line:
 pi install npm:pi-link && npm i -g pi-link
 ```
 
-The shell launcher is convenience-only — you can always reach the same functionality from inside Pi via `/link-connect <name>` and `/link-name <name>`.
-
-> **Why two installs?** Pi 0.75 installs Pi packages into a private npm root (`~/.pi/agent/npm/`) for safer permission handling ([pi-mono#4587](https://github.com/earendil-works/pi-mono/issues/4587)). That's where the Pi extension lives, but it means the `pi-link` shell command is no longer on system PATH. `npm i -g pi-link` puts it on PATH separately. Both installs are safe to use together.
+The shell launcher is convenience-only — you can always reach the same functionality from inside Pi via `/link-connect` and `/link-name <name>`.
 
 ### Uninstall
 
@@ -80,27 +78,18 @@ npm uninstall -g pi-link      # Remove CLI launcher (if you installed it)
 
 ### Usage
 
-Link is **off by default**. Start Pi with `--link` to auto-connect on startup:
+Link is **off by default**. Two ways to start:
 
-```
-Terminal 1                            Terminal 2
-----------                            ----------
-$ pi --link                           $ pi --link
-✓ Link hub started on :9900 as "t-a1b2"  ✓ Joined link as "t-c3d4" (2 online)
+```bash
+pi --link            # try it now, random name like t-a3f9
+pi-link mybot        # named session you can resume by name
 ```
 
-Use `pi-link <name>` to connect with a meaningful name and session resume:
+Already in a session? Use `/link-connect`. Use `/link` any time to check status, or let the LLM tools handle cross-terminal coordination. See [Session Resume](#session-resume) for `pi-link <name>` details.
 
-```
-$ pi-link builder                     $ pi-link reviewer
-✓ Link hub started on :9900 as "builder"  ✓ Joined link as "reviewer" (2 online)
-```
+### Notes on installation
 
-See [Session Resume](#session-resume) for details.
-
-Already in a session? Connect mid-session with `/link-connect`.
-
-Use `/link` in any terminal to check status, or let the LLM tools handle cross-terminal coordination.
+**Why two installs?** Pi 0.75 installs Pi packages into a private npm root (`~/.pi/agent/npm/`) for safer permission handling ([pi-mono#4587](https://github.com/earendil-works/pi-mono/issues/4587)). That's where the Pi extension lives, but it means the `pi-link` shell command is no longer on system PATH. `npm i -g pi-link` puts it on PATH separately. Both installs are safe to use together.
 
 ---
 
@@ -116,9 +105,9 @@ Here's a concrete example of two terminals collaborating. Open two separate `pi 
 
 > /link
 ⚡ Link: builder (hub) · 2 online
-  builder: idle (5s)
+  builder: idle (5s) · 45K/272K (17%)
     cwd: ~/my-project
-  researcher: idle (12s)
+  researcher: idle (12s) · 80K/272K (29%)
     cwd: ~/my-project
 ```
 
@@ -158,17 +147,26 @@ Every other terminal sees:
 
 Link is **off by default**. Without `--link`, `--link-name`, or `pi-link`, the extension is completely silent — no status bar, no connections, no warnings.
 
-| Method                  | When                                                             | Auto-reconnect?                  |
-| ----------------------- | ---------------------------------------------------------------- | -------------------------------- |
-| `pi-link <name>`        | Resume/create named session                                      | Yes                              |
-| `pi --link-name <name>` | Connect with a specific link name; Pi session behavior unchanged | Yes                              |
-| `pi --link`             | Connect on startup (random name)                                 | Yes                              |
-| `/link-connect`         | Opt-in mid-session (no flag needed)                              | Yes                              |
-| `/link-disconnect`      | Opt-out mid-session                                              | Suppressed until `/link-connect` |
+**Naming concepts**
 
-`pi --link-name <name>` sets only the pi-link terminal name; Pi's session selection/resume runs as normal. Use this when you want a stable link identity without coupling it to a same-named session. Use `pi-link <name>` when you want the combined session-by-name + link-name workflow. The `pi-link` wrapper itself does not accept `--link-name`.
+- **link name** — identity used on the network (visible in `link_list`, `/link`, prompts).
+- **Pi session name** — identity Pi gives the session itself; lives in the session JSONL's latest `session_info` entry.
+- **saved link name** — the link name persisted to the session, restored on resume. Set by `/link-name`, `pi-link <name>`, or `pi --link-name <name>`.
+- **`--link-name` flag vs `/link-name` command** — same concept (the link name) at different times (startup vs mid-session).
 
-**Name precedence:** `pi --link-name` > `pi-link <name>` > saved `/link-name` > Pi session name > random `t-xxxx`.
+| What you want                        | Use                     |
+| ------------------------------------ | ----------------------- |
+| Resume/create a named session        | `pi-link <name>`        |
+| Stable link identity, normal Pi flow | `pi --link-name <name>` |
+| Quick try, random name               | `pi --link`             |
+| Already in a session                 | `/link-connect`         |
+| Disconnect mid-session               | `/link-disconnect`      |
+
+`pi-link <name>` resumes/creates a session AND sets your link identity in one step. `pi --link-name <name>` sets only the link identity, leaving Pi's normal session selection (latest in cwd, or fresh) untouched.
+
+**Name normalization:** Link names are normalized — leading/trailing whitespace removed and internal whitespace runs collapsed to a single space. `/link-name "build   lead"` saves and shows as `build lead`.
+
+**Name precedence:** `pi --link-name` > `pi-link <name>` > saved `/link-name` > Pi session name > random `t-xxxx`. _(The `pi-link` wrapper itself does not accept `--link-name`; pick one or the other.)_
 
 `/link-connect` and `/link-disconnect` save their intent to the session — resume later and the connection state is restored without needing the flag. Explicit user intent takes precedence over `--link`.
 
@@ -228,15 +226,16 @@ For scripting, `pi-link --resolve <name>` prints just the session path (machine-
 
 ## LLM Tools
 
-The extension registers three tools that the LLM can invoke during agent runs. pi-link also ships with a bundled **pi-link-coordination** skill that gives agents on-demand guidance for tool selection, delegation patterns, and avoiding common coordination mistakes.
+The extension registers four tools that the LLM can invoke during agent runs. pi-link also ships with a bundled **pi-link-coordination** skill that gives agents on-demand guidance for tool selection, delegation patterns, and avoiding common coordination mistakes.
 
 ### Which tool should I use?
 
-| Tool          | Behavior                                             | Returns                                   |
-| ------------- | ---------------------------------------------------- | ----------------------------------------- |
-| `link_send`   | Send a message; optionally trigger the remote LLM    | Send/delivery status only                 |
-| `link_prompt` | Run a prompt on a remote terminal and wait for reply | The remote terminal's assistant response  |
-| `link_list`   | List currently connected terminals                   | Terminal list with roles, status, and cwd |
+| Tool           | Behavior                                             | Returns                                             |
+| -------------- | ---------------------------------------------------- | --------------------------------------------------- |
+| `link_send`    | Send a message; optionally trigger the remote LLM    | Send/delivery status only                           |
+| `link_prompt`  | Run a prompt on a remote terminal and wait for reply | The remote terminal's assistant response            |
+| `link_list`    | List currently connected terminals                   | Terminal list with roles, status, cwd, and context  |
+| `link_compact` | Ask another terminal to compact its context window   | Waits for completion; returns compacted or an error |
 
 **If you need the other terminal's answer back, use `link_prompt`.** Use `link_send` to notify or steer without waiting.
 
@@ -279,9 +278,11 @@ Send a prompt to a remote terminal and **wait** for the LLM's response (synchron
 
 ### `link_list`
 
-Lists all connected terminals with role info, live agent status, working directory, and self-identification. Takes no parameters.
+Lists all connected terminals with role info, live agent status, working directory, context usage, and self-identification. Takes no parameters.
 
 Each terminal reports its current working directory on connect. `link_list` shows the full absolute path so agents can choose the right target, use explicit paths when terminals differ, and catch wrong-project mistakes early.
+
+Each terminal also reports its current LLM context usage, rendered as `45K/272K (17%)` — tokens used over the context window, with percent. Briefly after compaction it shows as `?/272K` until the next live token count arrives. Treat it as an advisory signal when choosing a worker; prefer a less-loaded terminal for context-heavy delegation.
 
 Each terminal's status is derived automatically from Pi lifecycle events - agents can't set it manually. Three states:
 
@@ -299,13 +300,39 @@ Working directories use full absolute paths in tool output. In the TUI (`/link`)
 
 ```
 Connected terminals:
-  • opus@pi-link (you)  idle (12s)
+  • opus@pi-link (you)  idle (12s)  · 45K/272K (17%)
     cwd: C:\Users\andre\.pi
-  • gpt@pi-link  thinking (3s)
+  • gpt@pi-link  thinking (3s)  · ?/272K
     cwd: C:\Users\andre\.pi
-  • docs@pi-link  idle (1m)
+  • docs@pi-link  idle (1m)  · 90K/272K (33%)
     cwd: C:\Users\andre\.pi
 ```
+
+### `link_compact`
+
+Ask another terminal to compact its context window and **wait** until it finishes — so the very next call can dispatch new work to the freshly trimmed worker without a busy bounce.
+
+| Parameter      | Type     | Description                                            |
+| -------------- | -------- | ------------------------------------------------------ |
+| `to`           | `string` | Target terminal name                                   |
+| `instructions` | `string` | Optional custom compaction instructions for the target |
+
+- The remote terminal runs `ctx.compact()` — the same code path as `/compact`. The call returns once the runtime reports completion.
+- **Success** result: `Compacted "<name>"`. The worker is now idle with a trimmed context, ready for the next dispatch.
+- **Busy decline** — if the target is mid-turn or already compacting, it declines immediately with `reason: "busy"`. `link_compact` will **not** interrupt active work; retry when `link_list` shows the worker idle.
+- **Self-target rejection** — calling `link_compact` on yourself returns an error pointing at `/compact`.
+- **Flat 180-second timeout** — compaction typically takes 5–60s; if the target stops responding mid-compaction the call resolves with a timeout error.
+- Supports abort signals.
+- Targets **one terminal at a time** (no broadcast mode). To compact several workers concurrently, issue parallel tool calls.
+- **No consent or capability gate** — any connected terminal can request compaction on any other; link participants are cooperating peers.
+
+### Coordination recipes
+
+The four tools compose into coordination shapes worth naming:
+
+- **Fan-out** - split independent subtasks across several terminals with `link_send(triggerTurn: true)`, keep working, then synthesize the callbacks. Parallelizes work that doesn't share a sequence. If a worker's context (visible in `link_list`) runs high, `link_compact` trims it and returns when the worker is idle — feed it the next subtask immediately.
+- **Adversarial review** - have one terminal produce or edit work, then `link_prompt` another to critique it. Because `link_prompt` blocks on a reply from a separate session, the critique lands in the same turn; feed it back or revise locally.
+- **Independent cross-check** - send the same verification question to two terminals without sharing their answers, then reconcile - or ask a third to resolve disagreements. Separate contexts mean neither anchors on the other.
 
 ---
 
@@ -313,7 +340,7 @@ Connected terminals:
 
 | Command                 | Purpose                                                                                                                  |
 | ----------------------- | ------------------------------------------------------------------------------------------------------------------------ |
-| `/link`                 | Show link status (name, role, online count, agent status, and cwd per terminal)                                          |
+| `/link`                 | Show link status (name, role, online count, agent status, context usage, and cwd per terminal)                           |
 | `/link-name [name]`     | Rename and save as this session's preferred link name. With no argument, adopts the Pi session name. Restored on resume. |
 | `/link-broadcast <msg>` | Broadcast a chat message to all other terminals                                                                          |
 | `/link-connect`         | Connect to Pi Link (works anytime, with or without `--link`)                                                             |
@@ -324,11 +351,11 @@ Connected terminals:
 ```
 > /link
 ⚡ Link: builder (hub) · 3 online
-  builder: idle (12s)
+  builder: idle (12s) · 45K/272K (17%)
     cwd: ~/my-project
-  worker-1: thinking (3s)
+  worker-1: thinking (3s) · ?/272K
     cwd: ~/my-project
-  worker-2: tool:bash (5s)
+  worker-2: tool:bash (5s) · 180K/272K (66%)
     cwd: ~/other-project
 
 > /link-name orchestrator
@@ -405,11 +432,13 @@ If another process occupies port 9900, the terminal can't become the hub. It wil
 
 ### "Terminal is busy" rejections
 
-Each terminal can only execute **one remote prompt at a time**. If a `link_prompt` arrives while the agent is already running (either from a local user or another remote prompt), it's immediately rejected with `"Terminal is busy"`. There is no queuing. Solutions:
+Each terminal handles **one remote operation at a time** — a local agent run, an incoming `link_prompt`, or a `link_compact` all block the others. If a `link_prompt` arrives while the terminal is busy, it's immediately rejected with `"Terminal is busy"`. There is no queuing. Solutions:
 
 - Wait for the target terminal to finish its current task.
 - Spread prompts across multiple worker terminals.
 - Have the sender retry after a delay.
+
+A `link_compact` to a busy target behaves the same way — the call resolves with `Compact on "<target>" not done: busy` instead of interrupting active work. Retry when `link_list` shows the worker idle.
 
 ### Terminals don't see each other
 
@@ -493,19 +522,21 @@ When the hub goes down and a client promotes itself, terminal names and in-fligh
 
 ### Protocol
 
-The wire protocol consists of **9 message types**, all serialized as JSON over WebSocket frames. Cwd-related fields are optional.
+The wire protocol consists of **11 message types**, all serialized as JSON over WebSocket frames. Cwd and context fields are optional.
 
-| Type              | Direction       | Purpose                                                                 |
-| ----------------- | --------------- | ----------------------------------------------------------------------- |
-| `register`        | Client → Hub    | First message after connecting; requests a name, optionally reports cwd |
-| `welcome`         | Hub → Client    | Confirms assigned name, terminal list + status/cwd snapshots            |
-| `terminal_joined` | Hub → All       | Broadcast when a terminal joins; may include cwd                        |
-| `terminal_left`   | Hub → All       | Broadcast when a terminal disconnects                                   |
-| `chat`            | Any → Any/All   | Fire-and-forget message; optionally triggers LLM turn                   |
-| `prompt_request`  | Any → Any       | Request a remote terminal to execute a prompt                           |
-| `prompt_response` | Any → Any       | Response carrying the remote prompt result                              |
-| `status_update`   | Any → Hub → All | Terminal broadcasts its agent status change                             |
-| `error`           | Hub → Client    | Error notification                                                      |
+| Type               | Direction       | Purpose                                                                             |
+| ------------------ | --------------- | ----------------------------------------------------------------------------------- |
+| `register`         | Client → Hub    | First message after connecting; requests a name, optionally reports cwd and context |
+| `welcome`          | Hub → Client    | Confirms assigned name, terminal list + status/cwd/context snapshots                |
+| `terminal_joined`  | Hub → All       | Broadcast when a terminal joins; may include cwd and context                        |
+| `terminal_left`    | Hub → All       | Broadcast when a terminal disconnects                                               |
+| `chat`             | Any → Any/All   | Fire-and-forget message; optionally triggers LLM turn                               |
+| `prompt_request`   | Any → Any       | Request a remote terminal to execute a prompt                                       |
+| `prompt_response`  | Any → Any       | Response carrying the remote prompt result                                          |
+| `compact_request`  | Any → Any       | Request a remote terminal to compact its context; awaits a response                 |
+| `compact_response` | Any → Any       | Completion/failure response for a compact_request                                   |
+| `status_update`    | Any → Hub → All | Terminal broadcasts agent status change; carries updated context                    |
+| `error`            | Hub → Client    | Error notification                                                                  |
 
 ### Message Flow Examples
 
@@ -524,7 +555,7 @@ Client                         Hub
   |                             |
 ```
 
-Hub then broadcasts `terminal_joined` to the other connected terminals. The `welcome` message includes status and cwd snapshots for all connected terminals (fields omitted above for brevity). `terminal_joined` also includes the new terminal's optional cwd.
+Hub then broadcasts `terminal_joined` to the other connected terminals. The `welcome` message includes status, cwd, and context snapshots for all connected terminals (fields omitted above for brevity). `terminal_joined` also includes the new terminal's optional cwd and context.
 
 **Sending a chat message:**
 
@@ -590,7 +621,7 @@ Default names are random 4-character hex IDs: `t-a1b2`, `t-c3d4`, etc.
 
 `routeMessage()` returns a `boolean` indicating delivery status:
 
-- **Hub** - delivery is authoritative. If the target terminal isn't connected, the hub sends a protocol-level error back to the sender. For `prompt_request` messages to unknown targets, the hub sends a `prompt_response` with an error field so the sender's pending promise resolves immediately rather than timing out.
+- **Hub** - delivery is authoritative. If the target terminal isn't connected, the hub sends a protocol-level error back to the sender. For `prompt_request` messages to unknown targets, the hub sends a `prompt_response` with an error field so the sender's pending promise resolves immediately rather than timing out. Likewise, a `compact_request` to an unknown target gets a synthesized `compact_response` (`ok: false`, `reason: "not_found"`), so a remote-compact call fails fast instead of waiting out its 180-second timeout.
 - **Client** - delivery is optimistic (`true` means "sent to hub"). The hub handles routing and errors via the protocol.
 
 ### Connection Lifecycle
@@ -618,6 +649,7 @@ The extension hooks into Pi's agent lifecycle events:
 - **`agent_end`** → Wakes up the inbox flush (idle-gated delivery for `triggerTurn:true` messages). Checks if a remote prompt was running; if so, extracts the last assistant response from `event.messages` and sends back a `prompt_response`. Broadcasts `status_update` (`idle`).
 - **`tool_execution_start`** → Broadcasts `status_update` (`tool:<name>`).
 - **`tool_execution_end`** → Clears tool status; broadcasts `status_update` (`thinking`) while the agent run continues.
+- **`session_compact`** → Force-pushes a `status_update` so peers see the new (post-compaction) context usage immediately.
 - **`session_shutdown`** → Full cleanup via `cleanup()`: closes all sockets, resolves pending promises, and disposes the extension.
 
 Status updates are push-based: each terminal broadcasts changes to the hub, which fans them out. New joiners receive a status snapshot for all terminals in the `welcome` message.
