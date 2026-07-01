@@ -48,7 +48,7 @@ Synchronous RPC. Send a prompt, wait for the response.
 
 ### `link_send`
 
-Fire-and-forget. Send to one terminal or `to: "*"` to broadcast to every other connected terminal; there is no exclusion filter.
+Fire-and-forget. Send to one terminal or `to: "*"` to broadcast to every other connected terminal; there is no exclusion filter. Sending to yourself is rejected. A send to a name that isn't connected fails with an error listing who _is_ connected — delivery failure is visible to the sender, not silent.
 
 Set `triggerTurn: true` to queue async work on the receiver. The sender does **not** get an automatic response back.
 
@@ -69,7 +69,7 @@ Use `triggerTurn: false` for fire-and-forget status notifications only — when 
 
 ### `link_compact`
 
-Blocks until the target finishes compacting, then returns. Ask another terminal to compact its context window into a summary, freeing space. `link_list` exposes context usage; `link_compact` is the lever when you decide a terminal should free context — and because the call only returns once compaction is done, you can immediately hand it more work with `link_send`/`link_prompt` (no sleep, no busy-bounce). Busy targets (mid-turn or already compacting) decline; retry when `link_list` shows them idle. You decide the threshold; pi-link just runs the compaction you ask for. Its optional `instructions` add an extra focus to that summary.
+Blocks until the target finishes compacting, then returns (3 min ceiling — the call then errors for you, though the target may still finish compacting on its own; check it before assuming failure). Ask another terminal to compact its context window into a summary, freeing space. `link_list` exposes context usage; `link_compact` is the lever when you decide a terminal should free context — and because the call only returns once compaction is done, you can immediately hand it more work with `link_send`/`link_prompt` (no sleep, no busy-bounce). Busy targets (mid-turn or already compacting) decline; retry when `link_list` shows them idle. You decide the threshold; pi-link just runs the compaction you ask for. Its optional `instructions` add an extra focus to that summary.
 
 ---
 

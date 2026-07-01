@@ -433,7 +433,7 @@ export default function (pi: ExtensionAPI) {
 
   // ── Connection intent ──────────────────────────────────────────────────
 
-  function shouldConnect(_ctx: ExtensionContext): boolean {
+  function shouldConnect(): boolean {
     const data = latestCustomData("link-active") as
       | { active?: boolean }
       | undefined;
@@ -775,7 +775,9 @@ export default function (pi: ExtensionAPI) {
           });
         } else {
           pendingRemotePrompt = { id: msg.id, from: msg.from };
-          // Keepalive: periodic status push so sender knows we're alive
+          // Keepalive: periodic status push so sender knows we're alive.
+          // Keepalive presumes sendUserMessage() starts a run (platform contract);
+          // if it ever doesn't, the sender's 30 min hard ceiling is the backstop.
           if (keepaliveTimer) clearInterval(keepaliveTimer);
           keepaliveTimer = setInterval(
             () => pushStatus(true),
@@ -848,6 +850,7 @@ export default function (pi: ExtensionAPI) {
 
       // First message must be register
       if (msg.type === "register") {
+        if (clientName) return; // already registered — ignore duplicate
         clientName = uniqueName(msg.name);
         hubClients.set(clientWs, clientName);
         if (msg.cwd) hubTerminalCwds.set(clientName, msg.cwd);
@@ -1237,7 +1240,7 @@ export default function (pi: ExtensionAPI) {
       }
     }
 
-    if (flagName || shouldConnect(_ctx)) scheduleStartupConnect();
+    if (flagName || shouldConnect()) scheduleStartupConnect();
   });
 
   pi.on("session_shutdown", async () => {
@@ -1317,7 +1320,7 @@ export default function (pi: ExtensionAPI) {
   }
 
   function notConnectedResult() {
-    return textResult("Not connected to link");
+    return textResult("Not connected to link", { error: "not_connected" });
   }
 
   function truncatePreview(text: string, max = 60) {
@@ -1377,6 +1380,12 @@ export default function (pi: ExtensionAPI) {
 
       // Pre-validate target exists locally (best-effort, catches typos and definitely-absent names)
       if (params.to !== "*") {
+        if (params.to === terminalName) {
+          return textResult("Cannot send to yourself", {
+            to: params.to,
+            error: "self_target",
+          });
+        }
         const miss = targetNotFound(params.to);
         if (miss) return miss;
       }
@@ -1439,6 +1448,13 @@ export default function (pi: ExtensionAPI) {
     }),
 
     async execute(_toolCallId, params, signal) {
+      if (signal?.aborted) {
+        return textResult("Compact request aborted", {
+          to: params.to,
+          error: "aborted",
+        });
+      }
+
       if (role === "disconnected") return notConnectedResult();
 
       if (params.to === terminalName) {
@@ -1537,6 +1553,13 @@ export default function (pi: ExtensionAPI) {
     }),
 
     async execute(_toolCallId, params, signal) {
+      if (signal?.aborted) {
+        return textResult("Prompt request aborted", {
+          to: params.to,
+          error: "aborted",
+        });
+      }
+
       if (role === "disconnected") return notConnectedResult();
 
       if (params.to === terminalName) {

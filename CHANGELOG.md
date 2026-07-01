@@ -6,6 +6,25 @@ This changelog is based on the git history from `2026-03-21` (initial commit) th
 
 ---
 
+## 0.1.17 — 2026-07-01
+
+### Changed
+
+- **`link_send` now rejects self-targets.** Sending to your own link name returns an immediate `self_target` error instead of delivering the message back to yourself, matching the existing `link_prompt` and `link_compact` behavior.
+
+### Fixed
+
+- **Disconnected link tool calls are now marked as errors.** `notConnectedResult()` tags `error: "not_connected"`, so callers and renderers treat a disconnected call as a failure instead of a success-looking result.
+- **Hub ignores duplicate `register` messages.** A second `register` on an already-registered client socket is now dropped instead of re-running the join flow (which could reassign the name and emit a spurious re-join).
+- **`link_prompt` and `link_compact` honor an already-aborted signal.** Both tools now check `signal.aborted` at the top of `execute` and return an `error: "aborted"` result immediately, rather than starting work that was cancelled before it began.
+
+### Internal
+
+- Removed the unused `ExtensionContext` parameter from `shouldConnect()`.
+- Clarified the keepalive comment: it presumes `sendUserMessage()` starts a run, with the sender's 30-minute hard ceiling as the backstop if it ever doesn't.
+
+---
+
 ## 0.1.16 — 2026-06-09
 
 ### Added

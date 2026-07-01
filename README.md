@@ -255,7 +255,7 @@ Note: `triggerTurn` does **not** cause the response to come back to the caller -
 
 > **Broadcast note:** Sending to `"*"` delivers to **all other terminals** - the sender is excluded.
 
-Pre-validates the target name against the local terminal list before sending, catching typos early. See [Message Routing](#message-routing--error-handling) for delivery semantics.
+Pre-validates the target name against the local terminal list before sending, catching typos early. See [Message Routing](#message-routing--error-handling) for delivery semantics. **Self-target rejection** - sending to yourself (`to` equals your own name) returns an immediate error.
 
 ### `link_prompt`
 
