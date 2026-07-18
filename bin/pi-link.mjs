@@ -8,9 +8,7 @@
 //   pi-link --list [--global|-g] List pi-link sessions in current cwd (or everywhere).
 //   pi-link --resolve <name> [--global|-g]
 //                                Print just the session path (machine-readable).
-//
-// Deprecated subcommand forms `pi-link list` / `pi-link resolve <name>` still
-// work for one release with a stderr warning.
+//   pi-link --version            Print the installed pi-link version.
 
 import { readdir, stat } from "fs/promises";
 import { createReadStream, existsSync, readFileSync } from "fs";
@@ -18,6 +16,12 @@ import { createInterface } from "readline";
 import { join } from "path";
 import { homedir } from "os";
 import { spawn } from "child_process";
+
+// Canonicalize a link/session name: trim + collapse internal whitespace.
+// Must match the extension's normalizeName (index.ts).
+function normalizeName(s) {
+  return s.trim().replace(/\s+/g, " ");
+}
 
 // ── Pi config resolution ───────────────────────────────────────────────────
 // Match Pi's session-dir lookup order so list/resolve/<name> see what Pi sees.
@@ -88,11 +92,11 @@ async function getSessionMeta(filePath) {
         if (typeof entry.cwd === "string") cwd = entry.cwd;
         if (typeof entry.id === "string") id = entry.id;
       } else if (entry.type === "session_info" && typeof entry.name === "string") {
-        sessionName = entry.name.trim().replace(/\s+/g, " ") || undefined;
+        sessionName = normalizeName(entry.name) || undefined;
       } else if (entry.type === "custom" && entry.customType === "link-name") {
         hasLinkName = true;
         if (entry.data && typeof entry.data.name === "string") {
-          const n = entry.data.name.trim().replace(/\s+/g, " ");
+          const n = normalizeName(entry.data.name);
           if (n) linkName = n;
         }
       } else if (entry.type === "message" || entry.type === "user" || entry.type === "assistant") {
@@ -237,20 +241,9 @@ function renderTable(rows, columns) {
 
 const rawArgs = process.argv.slice(2);
 
-// Reject pi-link flags renamed in 0.1.12 with a clear pointer to the new name.
-// Same intent as `rejectManagedFlag` (specific message > generic "Unknown argument")
-// but for our own renames, not Pi-managed flags.
-function rejectRenamedFlag(token) {
-  if (token === "--all" || token === "-a") {
-    const replacement = token === "-a" ? "-g" : "--global";
-    console.error(`Error: ${token} was renamed to ${replacement}.`);
-    process.exit(1);
-  }
-}
-
 // Reject Pi flags that pi-link manages, plus --link-name (which exists at the
 // `pi` level for link-only naming, but the wrapper's combined-mode contract
-// conflicts with it). Called from Phase 6 (mode entry) and Phase 7 (after
+// conflicts with it). Called from Phase 4 (mode entry) and Phase 5 (after
 // launcher name), so it fires on both `pi-link --session foo` and
 // `pi-link foo --session bar` with the friendly message.
 function rejectManagedFlag(token) {
@@ -288,22 +281,27 @@ function printHelp() {
   console.error("Usage: pi-link <name> [--global|-g] [pi flags...]");
   console.error("       pi-link --list [--global|-g]");
   console.error("       pi-link --resolve <name> [--global|-g]");
+  console.error("       pi-link --version");
   console.error("");
   console.error("By default, name lookup is scoped to the current cwd.");
   console.error("--global / -g widens the search to sessions in any cwd.");
 }
 
-function printDeprecationWarning(form) {
-  const canonical = form === "list" ? "--list" : "--resolve";
-  console.error(
-    `Warning: 'pi-link ${form}' is deprecated. Use 'pi-link ${canonical}' instead. ` +
-    `(Subcommand form will be removed in a future release.)`,
-  );
+function printVersion() {
+  try {
+    const pkg = JSON.parse(
+      readFileSync(new URL("../package.json", import.meta.url), "utf-8"),
+    );
+    console.log(pkg.version ?? "unknown");
+  } catch {
+    console.log("unknown");
+  }
 }
 
 function describeMode(mode) {
   switch (mode) {
     case "help": return "--help";
+    case "version": return "--version";
     case "list": return "--list";
     case "resolve": return "--resolve";
     case "launcher": return "session name";
@@ -313,23 +311,19 @@ function describeMode(mode) {
 
 // ── Parser ─────────────────────────────────────────────────────────────────
 //
-// Single sequential pass populates `state`; dispatcher reads it. Phases (per
-// PLAN-cli-flags.md):
-//   1. Renamed-flag rejection (always-on for --all/-a)
-//   2. Global flags (--global, --help, --)
-//   3. Mode-selecting flags (--list, --resolve, --resolve=<name>)
-//   4. Deprecated subcommands (list, resolve <name>) — only at mode-null position
-//   5. Mode-specific extra-token rejection (with deprecated-resolve leniency)
-//   6. Launcher mode entry (mode null + bare positional)
-//   7. Launcher passthrough (mode launcher) with orphan-positional rejection
+// Single sequential pass populates `state`; dispatcher reads it. Phases:
+//   1. Global flags (--global, --help, --version, --)
+//   2. Mode-selecting flags (--list, --resolve, --resolve=<name>)
+//   3. Mode-specific extra-token rejection
+//   4. Launcher mode entry (mode null + bare positional)
+//   5. Launcher passthrough (mode launcher) with orphan-positional rejection
 
 const state = {
-  mode: null, // null | "help" | "list" | "resolve" | "launcher"
+  mode: null, // null | "help" | "version" | "list" | "resolve" | "launcher"
   resolveName: null,
   launcherName: null,
   global: false,
   piPassthrough: [],
-  deprecated: null, // null | "list" | "resolve"
 };
 
 function setMode(mode) {
@@ -344,10 +338,7 @@ let lastWasFlag = false;
 for (let i = 0; i < rawArgs.length; i++) {
   const a = rawArgs[i];
 
-  // Phase 1: renamed-flag rejection.
-  rejectRenamedFlag(a);
-
-  // Phase 2: global flags / scope-affecting tokens.
+  // Phase 1: global flags / scope-affecting tokens.
   if (a === "--global" || a === "-g") {
     state.global = true;
     lastWasFlag = false;
@@ -355,6 +346,10 @@ for (let i = 0; i < rawArgs.length; i++) {
   }
   if (a === "--help" || a === "-h") {
     setMode("help"); // errors if combined with another mode
+    continue;
+  }
+  if (a === "--version") {
+    setMode("version"); // errors if combined with another mode
     continue;
   }
   if (a === "--") {
@@ -369,7 +364,7 @@ for (let i = 0; i < rawArgs.length; i++) {
     break;
   }
 
-  // Phase 3: mode-selecting flags.
+  // Phase 2: mode-selecting flags.
   if (a === "--list") {
     setMode("list");
     continue;
@@ -392,57 +387,36 @@ for (let i = 0; i < rawArgs.length; i++) {
     continue;
   }
 
-  // Phase 4: deprecated subcommands (only at mode-null position).
-  if (state.mode === null && (a === "list" || a === "resolve")) {
-    state.deprecated = a;
-    if (a === "list") {
-      setMode("list");
-    } else {
-      setMode("resolve");
-      const next = rawArgs[i + 1];
-      if (next !== undefined && !next.startsWith("-")) {
-        state.resolveName = next;
-        i++;
-      }
-      // else: leave null; Phase 5 leniency or post-parse validation handles it.
-    }
-    continue;
-  }
-
-  // Phase 5: mode-specific extra-token rejection.
+  // Phase 3: mode-specific extra-token rejection.
   if (state.mode === "help") {
     fail(`--help does not accept arguments: ${a}`);
+  }
+  if (state.mode === "version") {
+    fail(`--version does not accept arguments: ${a}`);
   }
   if (state.mode === "list") {
     fail(`--list does not accept argument: ${a}\n  Usage: pi-link --list [--global|-g]`);
   }
   if (state.mode === "resolve") {
-    // Deprecated-form leniency: `pi-link resolve --global foo` was order-independent;
-    // if we entered via deprecated path and haven't bound a name yet, take this.
-    if (
-      state.deprecated === "resolve" &&
-      state.resolveName === null &&
-      !a.startsWith("-")
-    ) {
-      state.resolveName = a;
-      continue;
-    }
     fail(`--resolve accepts exactly one name; got extra: ${a}`);
   }
 
-  // Phase 6: launcher mode entry. state.mode === null here, no name set yet.
-  // (lastWasFlag is still false here — only Phase 7 sets it, and Phase 7 requires launcher mode.)
+  // Phase 4: launcher mode entry. state.mode === null here, no name set yet.
+  // (lastWasFlag is still false here — only Phase 5 sets it, and Phase 5 requires launcher mode.)
   if (state.mode === null) {
     rejectManagedFlag(a);
     if (a.startsWith("-")) {
       fail(`Unknown argument: ${a}\n  Usage: pi-link <name> [--global|-g] [pi flags...]`);
+    }
+    if (a === "list" || a === "resolve") {
+      fail(`'pi-link ${a}' was removed. Use 'pi-link --${a}'.`);
     }
     state.mode = "launcher";
     state.launcherName = a;
     continue;
   }
 
-  // Phase 7: launcher mode, name set. Tokens go to passthrough or get rejected.
+  // Phase 5: launcher mode, name set. Tokens go to passthrough or get rejected.
   rejectManagedFlag(a);
   if (a.startsWith("-")) {
     state.piPassthrough.push(a);
@@ -466,22 +440,18 @@ if (state.mode === "resolve") {
   if (state.resolveName === null) {
     fail(`--resolve requires a name argument.\n  Usage: pi-link --resolve <name> [--global|-g]`);
   }
-  const normalized = state.resolveName.trim().replace(/\s+/g, " ");
+  const normalized = normalizeName(state.resolveName);
   if (!normalized) {
     fail(`--resolve requires a non-empty name argument.\n  Usage: pi-link --resolve <name> [--global|-g]`);
   }
   state.resolveName = normalized;
 }
 if (state.mode === "launcher") {
-  const normalized = state.launcherName.trim().replace(/\s+/g, " ");
+  const normalized = normalizeName(state.launcherName);
   if (!normalized) {
     fail(`session name cannot be empty.\n  Usage: pi-link <name> [--global|-g] [pi flags...]`);
   }
   state.launcherName = normalized;
-}
-
-if (state.deprecated) {
-  printDeprecationWarning(state.deprecated);
 }
 
 // ── Dispatch ───────────────────────────────────────────────────────────────
@@ -490,6 +460,10 @@ switch (state.mode) {
   case null:
   case "help":
     printHelp();
+    process.exit(0);
+    break; // unreachable; present to satisfy no-fallthrough lints
+  case "version":
+    printVersion();
     process.exit(0);
     break; // unreachable; present to satisfy no-fallthrough lints
   case "list":
@@ -517,18 +491,18 @@ async function runList(state) {
   }
   const columns = state.global
     ? [
-        { header: "NAME", get: (s) => s.name },
-        { header: "CWD", get: (s) => displayPath(s.cwd) },
-        { header: "MODIFIED", get: (s) => relTime(s.modified), dim: true },
-        { header: "MESSAGES", get: (s) => s.messages, dim: true },
-        { header: "ID", get: (s) => s.id, dim: true },
-      ]
+      { header: "NAME", get: (s) => s.name },
+      { header: "CWD", get: (s) => displayPath(s.cwd) },
+      { header: "MODIFIED", get: (s) => relTime(s.modified), dim: true },
+      { header: "MESSAGES", get: (s) => s.messages, dim: true },
+      { header: "ID", get: (s) => s.id, dim: true },
+    ]
     : [
-        { header: "NAME", get: (s) => s.name },
-        { header: "MODIFIED", get: (s) => relTime(s.modified), dim: true },
-        { header: "MESSAGES", get: (s) => s.messages, dim: true },
-        { header: "ID", get: (s) => s.id, dim: true },
-      ];
+      { header: "NAME", get: (s) => s.name },
+      { header: "MODIFIED", get: (s) => relTime(s.modified), dim: true },
+      { header: "MESSAGES", get: (s) => s.messages, dim: true },
+      { header: "ID", get: (s) => s.id, dim: true },
+    ];
   console.log(renderTable(sessions, columns));
   if (process.stdout.isTTY) {
     console.log("");

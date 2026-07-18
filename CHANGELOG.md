@@ -6,6 +6,26 @@ This changelog is based on the git history from `2026-03-21` (initial commit) th
 
 ---
 
+## 0.2.0 — 2026-07-17
+
+### Added
+
+- **`pi-link --version` prints the installed package version.** It writes the bare semver to stdout and exits successfully, so users can identify the installed build during testing.
+
+### Breaking
+
+- **Removed the deprecated `pi-link list` and `pi-link resolve <name>` command forms.** They now error with migration guidance; use `pi-link --list` and `pi-link --resolve <name>` instead. The canonical flag forms are unchanged.
+
+### Changed
+
+- **The wrapper no longer reserves legacy `--all` / `-a` flags.** Before a session name, they receive the normal unknown-argument error; after a session name, they pass through to Pi unchanged. Use `--global` / `-g` for pi-link's cross-directory session lookup.
+
+### Fixed
+
+- **Malformed saved link names no longer crash startup.** A non-string `link-name` session entry is ignored and naming falls through to the session name or random default; well-formed name precedence is unchanged.
+
+---
+
 ## 0.1.17 — 2026-07-01
 
 ### Changed

@@ -220,8 +220,6 @@ Resume: pi-link <name>
 
 For scripting, `pi-link --resolve <name>` prints just the session path (machine-readable, no other output). Exit codes: `0` on single match, `1` if ambiguous (multiple matches printed to stderr), `2` if not found.
 
-> The legacy subcommand forms `pi-link list` and `pi-link resolve <name>` still work but print a stderr deprecation warning and will be removed in a future release. Switch to the flag forms above.
-
 ---
 
 ## LLM Tools
