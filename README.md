@@ -2,7 +2,9 @@
 
 A WebSocket-based inter-terminal communication system that creates a local network between multiple Pi coding agent terminals. Enables terminals to discover each other, exchange messages, and orchestrate work across agents - all automatically on `localhost`.
 
-> Three patterns out of the box: ask another agent for an answer (`link_prompt`), delegate async work (`link_send` with `triggerTurn:true`), or broadcast to every other terminal (`/link-broadcast`). Start two Pi terminals with `--link` — they find each other automatically.
+> Message another Pi terminal with `link_send`. Replies are ordinary messages the other agent chooses to send, not automatic responses. Start two Pi terminals with `--link` — they find each other automatically.
+
+Questions, ideas? There's a [pi-link thread](https://discord.com/channels/1456806362351669492/1485515696719921183) in the official Pi Discord.
 
 ---
 
@@ -28,16 +30,18 @@ A WebSocket-based inter-terminal communication system that creates a local netwo
 A single Pi terminal is powerful. Multiple terminals working together unlock new patterns:
 
 - **Research + Build** - one terminal investigates APIs, docs, or logs while another writes code based on the findings.
-- **Fan-out** - split a large task across agents (e.g., "terminal A handles the backend, terminal B handles the frontend") and collect results.
-- **Orchestrator / Worker** - designate one terminal as a coordinator that delegates subtasks to others via `link_prompt` and assembles the final output.
+- **Parallel work** - split a large task across agents (e.g., "terminal A handles the backend, terminal B handles the frontend") and collect results.
+- **Orchestrator / Worker** - designate one terminal as a coordinator that delegates subtasks with `link_send`, tracks callbacks, and assembles the final output.
 - **Review pipeline** - one terminal writes code, another reviews it, back and forth until both are satisfied.
 
 ---
 
 ## Prerequisites
 
-- [Pi coding agent](https://github.com/badlogic/pi-mono), version **0.74 or later** (for pi-link 0.1.15+). On Pi ≤0.73, pin `pi-link@0.1.14`.
+- [Pi coding agent](https://github.com/badlogic/pi-mono), version **0.84.2 or later** (for pi-link 0.3+). On Pi 0.74–0.84.1, pin `pi-link@0.2.x`; on Pi ≤0.73, pin `pi-link@0.1.14`.
 - Node.js (LTS recommended)
+
+Pi's package installation does not check the host version, so `pi install` succeeds on an older Pi. pi-link then refuses to initialize instead of half-running: it throws before registering anything, and Pi reports it under **[Extension issues]** with the required minimum and the version it detected. Nothing else about the session changes.
 
 ---
 
@@ -45,7 +49,7 @@ A single Pi terminal is powerful. Multiple terminals working together unlock new
 
 ### Install
 
-The minimum install — enables every in-Pi feature (`/link`, `link_send`, `link_prompt`, `/link-connect`, `--link` flag, auto-resume, all LLM tools):
+The minimum install — enables every in-Pi feature (`/link`, `link_send`, `/link-connect`, `--link` flag, auto-resume, and all LLM tools):
 
 ```bash
 pi install npm:pi-link
@@ -97,18 +101,11 @@ Already in a session? Use `/link-connect`. Use `/link` any time to check status,
 
 Here's a concrete example of two terminals collaborating. Open two separate `pi --link` sessions.
 
-**Terminal 1** - rename and check status:
+**Terminal 1** - rename it:
 
 ```
 > /link-name builder
 ✓ Renamed to "builder"
-
-> /link
-⚡ Link: builder (hub) · 2 online
-  builder: idle (5s) · 45K/272K (17%)
-    cwd: ~/my-project
-  researcher: idle (12s) · 80K/272K (29%)
-    cwd: ~/my-project
 ```
 
 **Terminal 2** - rename it too:
@@ -118,38 +115,36 @@ Here's a concrete example of two terminals collaborating. Open two separate `pi 
 ✓ Reconnecting, requesting "researcher" (hub may assign a different name if taken)...
 ```
 
+`/link-name` reconnects under the new name, so wait for Terminal 2 to come back before checking. **Back in Terminal 1**, both names are now visible:
+
+```
+> /link
+⚡ Link: builder (hub) · 2 online
+  builder: idle (5s) · 45K/272K (17%)
+    cwd: ~/my-project
+  researcher: idle (12s) · 80K/272K (29%)
+    cwd: ~/my-project
+```
+
 **Now ask Terminal 1's LLM to delegate work:**
 
 In Terminal 1, type a normal prompt:
 
 ```
-> Use link_prompt to ask "researcher" to summarize the contents of README.md in this directory
+> Use link_send to ask "researcher" to summarize README.md, then report DONE with the summary back to builder
 ```
 
-The LLM in Terminal 1 calls `link_prompt` → Terminal 2's LLM receives the prompt, reads the file, and sends back a summary → Terminal 1's LLM presents the result to you.
-
-**Or broadcast a message to all terminals:**
-
-```
-> /link-broadcast starting the deployment pipeline
-✓ Broadcast sent
-```
-
-Every other terminal sees:
-
-```
-⚡ [builder] starting the deployment pipeline
-```
+Terminal 1 calls `link_send` and returns immediately. The message enters Terminal 2's reasoning — steered into its current run if it is working, or starting a turn if it is idle. Terminal 2 completes the assignment, then sends a conventional `DONE` callback. That callback enters Terminal 1 the same way, where the result can be presented or used for follow-up work.
 
 ---
 
 ## Configuration
 
-Link is **off by default**. Without `--link`, `--link-name`, or `pi-link`, the extension is completely silent — no status bar, no connections, no warnings.
+Link is **off by default**. Without `--link`, `--link-name`, or `pi-link`, a fresh session is completely silent — no status bar, no connections, no warnings.
 
 **Naming concepts**
 
-- **link name** — identity used on the network (visible in `link_list`, `/link`, prompts).
+- **link name** — identity used on the network (visible in `link_list`, `/link`, and messages).
 - **Pi session name** — identity Pi gives the session itself; lives in the session JSONL's latest `session_info` entry.
 - **saved link name** — the link name persisted to the session, restored on resume. Set by `/link-name`, `pi-link <name>`, or `pi --link-name <name>`.
 - **`--link-name` flag vs `/link-name` command** — same concept (the link name) at different times (startup vs mid-session).
@@ -183,10 +178,10 @@ pi-link worker-1 --model sonnet # with extra Pi flags
 
 How it works: `pi-link worker-1` scans Pi's session directory, finds the session named "worker-1", and spawns `pi --session <path> --link`. Session-dir resolution matches Pi's lookup order: `PI_CODING_AGENT_SESSION_DIR` env > `<cwd>/.pi/settings.json` `sessionDir` > `<agentDir>/settings.json` `sessionDir` > default `<agentDir>/sessions/`. `<agentDir>` follows `PI_CODING_AGENT_DIR` and defaults to `~/.pi/agent/`.
 
-Lookup is **scoped to the current cwd by default**; pass `--global` (`-g`) to consider sessions in any cwd.
+Lookup is **scoped to the current cwd by default**; pass `--global` (`-g`) to consider sessions in any cwd. A scoped lookup stops reading a session file as soon as its header names another cwd, so it never learns the names of sessions belonging to other directories, and its cost tracks this cwd's own history rather than the history of unrelated projects.
 
 - **One match in scope** → resumes that session
-- **No match in scope** → creates a new session in the current cwd. If matches exist outside the scope, prints a hint pointing at `--global`.
+- **No match in scope** → creates a new session in the current cwd, and advises `--global` without claiming a session exists elsewhere.
 - **Multiple matches in scope** → prints candidates to stderr, exits 1
 - **Conflicting flags** (`--session`, `--continue`, `--resume`, `--fork`, etc.) → rejected with an error
 
@@ -216,7 +211,7 @@ Resume: pi-link <name>
 
 `--global` adds a `CWD` column with `~` substituted for `$HOME`. Output is plain when piped (`NO_COLOR` honored).
 
-`pi-link <name>` and `pi-link --resolve <name>` follow the same scoping: local cwd by default, `--global` (or `-g`) widens. When `pi-link <name>` finds no local match but matches exist elsewhere, it warns and points at `--global` instead of silently jumping cwds.
+`pi-link <name>` and `pi-link --resolve <name>` follow the same scoping: local cwd by default, `--global` (or `-g`) widens. A local miss never silently jumps cwds: it says the name was not found here and suggests `--global`. Because a local scan skips sessions from other cwds without reading them, that suggestion is advice rather than a report that a match exists elsewhere - run it with `--global` to find out.
 
 For scripting, `pi-link --resolve <name>` prints just the session path (machine-readable, no other output). Exit codes: `0` on single match, `1` if ambiguous (multiple matches printed to stderr), `2` if not found.
 
@@ -224,71 +219,57 @@ For scripting, `pi-link --resolve <name>` prints just the session path (machine-
 
 ## LLM Tools
 
-The extension registers four tools that the LLM can invoke during agent runs. pi-link also ships with a bundled **pi-link-coordination** skill that gives agents on-demand guidance for tool selection, delegation patterns, and avoiding common coordination mistakes.
+The extension registers three tools. `link_send` is the sole agent messaging tool; `link_list` provides discovery and status, and `link_compact` is a separate bounded blocking operation. pi-link also ships a **pi-link-coordination** skill that explains how the tools behave.
 
 ### Which tool should I use?
 
-| Tool           | Behavior                                             | Returns                                             |
-| -------------- | ---------------------------------------------------- | --------------------------------------------------- |
-| `link_send`    | Send a message; optionally trigger the remote LLM    | Send/delivery status only                           |
-| `link_prompt`  | Run a prompt on a remote terminal and wait for reply | The remote terminal's assistant response            |
-| `link_list`    | List currently connected terminals                   | Terminal list with roles, status, cwd, and context  |
-| `link_compact` | Ask another terminal to compact its context window   | Waits for completion; returns compacted or an error |
-
-**If you need the other terminal's answer back, use `link_prompt`.** Use `link_send` to notify or steer without waiting.
+| Tool           | Behavior                                                | Returns                                                 |
+| -------------- | ------------------------------------------------------- | ------------------------------------------------------- |
+| `link_send`    | Send a message to one other terminal                    | Reports whether sending started, not whether it arrived |
+| `link_list`    | List currently connected terminals                      | Terminal list with roles, status, cwd, and context      |
+| `link_compact` | Ask another terminal to compact and wait for its result | Compacted, declined, or failed                          |
 
 ### `link_send`
 
-Send a fire-and-forget chat message to a specific terminal or broadcast to all.
-
-| Parameter     | Type      | Description                                          |
-| ------------- | --------- | ---------------------------------------------------- |
-| `to`          | `string`  | Target terminal name, or `"*"` for broadcast         |
-| `message`     | `string`  | Message content                                      |
-| `triggerTurn` | `boolean` | If `true`, the receiver's LLM responds automatically |
-
-When `triggerTurn` is enabled, the message is queued in the receiver's local inbox. Nearby arrivals are coalesced (200ms debounce), and delivery is gated on the receiving agent being idle - ensuring it starts a clean new turn. Messages arrive as a single `[Link: N message(s) received]` block at the top of a fresh turn, not mid-run. When `triggerTurn` is `false` or omitted, delivery is immediate fire-and-forget.
-
-Note: `triggerTurn` does **not** cause the response to come back to the caller - use `link_prompt` for that.
-
-> **Broadcast note:** Sending to `"*"` delivers to **all other terminals** - the sender is excluded.
-
-Pre-validates the target name against the local terminal list before sending, catching typos early. See [Message Routing](#message-routing--error-handling) for delivery semantics. **Self-target rejection** - sending to yourself (`to` equals your own name) returns an immediate error.
-
-### `link_prompt`
-
-Send a prompt to a remote terminal and **wait** for the LLM's response (synchronous RPC pattern).
+Send a message to one other terminal. The sender returns immediately.
 
 | Parameter | Type     | Description          |
 | --------- | -------- | -------------------- |
 | `to`      | `string` | Target terminal name |
-| `prompt`  | `string` | Prompt text to send  |
+| `message` | `string` | Message content      |
 
-- The remote terminal processes the prompt via `pi.sendUserMessage()` - as if a user typed it.
-- Returns the remote terminal's actual assistant reply text as the tool result.
-- **Self-target rejection** - prompting yourself (`to` equals your own name) returns an immediate error.
-- **Heartbeat-based timeout** - no short fixed deadline. The target sends keepalives every 30s while working. The sender resets a 90-second inactivity timer on each keepalive. A 30-minute hard ceiling acts as a safety net against broken-but-chatty targets. A 10-minute task with regular activity never times out; a genuinely dead target times out in 90 seconds of silence.
-- **Immediate failure on disconnect** - if the target leaves the network (`terminal_left`), pending prompts to that target fail immediately instead of waiting for the inactivity timeout.
-- **Early failure detection** - if the message can't be delivered (e.g., target not found), the tool resolves immediately with an error instead of waiting for the timeout.
-- Supports abort signals.
-- Targets **one terminal at a time** (no broadcast mode).
-- Only **one remote prompt** can execute at a time per target terminal. Concurrent requests are rejected with `"Terminal is busy"`.
+When a message reaches the target terminal, it enters the receiver's inbox. Messages arriving close together may be delivered in one batch. The first message sets a delay of about 200ms; later messages do not extend it, so continuous traffic still gets delivered regularly. Each batch arrives as one `[Link: N message(s) received]` block, in arrival order, with each message under a `From "name":` header.
+
+The receiver's state is read when that batch is delivered, not when it is sent. If the receiver is still running then, the batch is steered into that run at Pi's next safe boundary — current tool calls finish first, before the next LLM call. Otherwise it starts a turn. There is no way to send without entering the receiver's reasoning.
+
+Each send has exactly one recipient; there is no fan-out.
+
+`link_send` never returns the receiver's eventual work result. A reply is an ordinary later `link_send`, uncorrelated with the message that prompted it: there is no request ID, no automatic response, and no delivery receipt for completed work.
+
+Targets are pre-validated against the local terminal list to catch definite typos or offline names. Sending to yourself is rejected. For a client, a successful send means the message was handed to its connection to the hub. It does not confirm that the hub routed it or that the receiver saw it — see [Message Routing](#message-routing--error-handling).
 
 ### `link_list`
 
-Lists all connected terminals with role info, live agent status, working directory, context usage, and self-identification. Takes no parameters.
+Lists all connected terminals with role info, status, working directory, context usage, and self-identification. Takes no parameters. Your own status and context are read when you run `link_list`; for other terminals, you see their most recently reported values, which may be slightly behind.
 
-Each terminal reports its current working directory on connect. `link_list` shows the full absolute path so agents can choose the right target, use explicit paths when terminals differ, and catch wrong-project mistakes early.
+Each terminal reports its current working directory on connect. `link_list` shows the full absolute path.
 
-Each terminal also reports its current LLM context usage, rendered as `45K/272K (17%)` — tokens used over the context window, with percent. Briefly after compaction it shows as `?/272K` until the next live token count arrives. Treat it as an advisory signal when choosing a worker; prefer a less-loaded terminal for context-heavy delegation.
+Each terminal also reports its LLM context usage, rendered as `45K/272K (17%)` — tokens used over the context window, with percent. Briefly after compaction it shows as `?/272K` until the next measured context value is available.
 
-Each terminal's status is derived automatically from Pi lifecycle events - agents can't set it manually. Three states:
+Each terminal's status is derived automatically from Pi lifecycle events - agents can't set it manually. Four states:
 
-| Status            | Meaning                 |
-| ----------------- | ----------------------- |
-| `idle (2m)`       | Waiting for user input  |
-| `thinking (3s)`   | LLM is generating       |
-| `tool:bash (12s)` | Running a specific tool |
+| Status            | Meaning                                      |
+| ----------------- | -------------------------------------------- |
+| `idle (2m)`       | Waiting for user input                       |
+| `thinking (3s)`   | LLM is generating                            |
+| `tool:bash (12s)` | The first still-active call, not a list      |
+| `compacting (8s)` | Manual compaction gate raised; messages held |
+
+Pi can run tools in parallel, and does by default. `tool:<name>` then names the first still-active call Pi reported — one call that really is still running, not a list of every concurrent one. It advances only when that call ends, and stays `tool:<name>` until the last call ends.
+
+`thinking` means work Pi has not settled yet, which is more than an LLM call: an automatic retry, an automatic compaction and a queued continuation all happen after `agent_end` and inside the same run, and the terminal reports `thinking` through all of them until Pi reports the run settled.
+
+Only a manual compaction shows `compacting`. An automatic (threshold or overflow) compaction never shows it — it is not gated, so it reports `thinking` like the rest of the run it belongs to. A manual compaction also runs briefly before the gate rises, and reads as whatever preceded it until it does.
 
 Durations are computed at render time from a `since` timestamp - no timer traffic over the wire. Terminals that just joined with no status data yet render as blank, not fake idle.
 
@@ -308,41 +289,36 @@ Connected terminals:
 
 ### `link_compact`
 
-Ask another terminal to compact its context window and **wait** until it finishes — so the very next call can dispatch new work to the freshly trimmed worker without a busy bounce.
+Ask another terminal to compact its context window and wait up to 180 seconds for a result. The target may compact successfully, decline, or return an error. After a successful result, the next call can dispatch work to the freshly trimmed worker.
 
 | Parameter      | Type     | Description                                            |
 | -------------- | -------- | ------------------------------------------------------ |
 | `to`           | `string` | Target terminal name                                   |
 | `instructions` | `string` | Optional custom compaction instructions for the target |
 
-- The remote terminal runs `ctx.compact()` — the same code path as `/compact`. The call returns once the runtime reports completion.
+- When the target accepts, it runs `ctx.compact()` — the same operation as `/compact`. Success is returned only after the runtime reports that it finished.
 - **Success** result: `Compacted "<name>"`. The worker is now idle with a trimmed context, ready for the next dispatch.
-- **Busy decline** — if the target is mid-turn or already compacting, it declines immediately with `reason: "busy"`. `link_compact` will **not** interrupt active work; retry when `link_list` shows the worker idle.
+- **Busy decline** — the target accepts only when Pi reports its session idle **and** no manual compaction holds its delivery gate; otherwise it declines immediately with `reason: "busy"` and does not interrupt active work. Pi's idle state is the authority, so an active run, an automatic retry, an automatic compaction and a queued continuation all decline, not just a visible turn.
+- **Unsupported decline** — a target whose runtime offers no compaction capability declines with `reason: "unsupported"`, and is never asked to compact.
+- **Too-small decline** — a target whose session is under the runtime's compaction threshold declines with `Compact on "<target>" not done: Nothing to compact (session too small)`.
+- **Already-compacted decline** — a target that has done nothing since its last compaction declines with `Compact on "<target>" not done: Already compacted`. Two compactions back to back require work in between.
 - **Self-target rejection** — calling `link_compact` on yourself returns an error pointing at `/compact`.
-- **Flat 180-second timeout** — compaction typically takes 5–60s; if the target stops responding mid-compaction the call resolves with a timeout error.
-- Supports abort signals.
-- Targets **one terminal at a time** (no broadcast mode). To compact several workers concurrently, issue parallel tool calls.
-- **No consent or capability gate** — any connected terminal can request compaction on any other; link participants are cooperating peers.
-
-### Coordination recipes
-
-The four tools compose into coordination shapes worth naming:
-
-- **Fan-out** - split independent subtasks across several terminals with `link_send(triggerTurn: true)`, keep working, then synthesize the callbacks. Parallelizes work that doesn't share a sequence. If a worker's context (visible in `link_list`) runs high, `link_compact` trims it and returns when the worker is idle — feed it the next subtask immediately.
-- **Adversarial review** - have one terminal produce or edit work, then `link_prompt` another to critique it. Because `link_prompt` blocks on a reply from a separate session, the critique lands in the same turn; feed it back or revise locally.
-- **Independent cross-check** - send the same verification question to two terminals without sharing their answers, then reconcile - or ask a third to resolve disagreements. Separate contexts mean neither anchors on the other.
+- **Flat 180-second timeout** — compaction typically takes 5–60s. The timeout bounds the caller's wait only; nothing aborts the target, so a timed-out call may mean the compaction is still running.
+- **A cancelled compaction does not reopen delivery by itself** — pi-link cannot observe the cancellation. The target may keep reporting `compacting` and hold messages without notifying the sender until its next agent run, a later successful compaction, or the 180-second backstop.
+- **Caller abort** — if the call is aborted before the request is sent, the target does nothing. After the request is sent, aborting only stops the caller from waiting; it does not cancel the target's work.
+- Each call targets one terminal; independent calls can run concurrently.
+- Any connected terminal can request compaction on another; link participants are cooperating peers.
 
 ---
 
 ## Slash Commands
 
-| Command                 | Purpose                                                                                                                  |
-| ----------------------- | ------------------------------------------------------------------------------------------------------------------------ |
-| `/link`                 | Show link status (name, role, online count, agent status, context usage, and cwd per terminal)                           |
-| `/link-name [name]`     | Rename and save as this session's preferred link name. With no argument, adopts the Pi session name. Restored on resume. |
-| `/link-broadcast <msg>` | Broadcast a chat message to all other terminals                                                                          |
-| `/link-connect`         | Connect to Pi Link (works anytime, with or without `--link`)                                                             |
-| `/link-disconnect`      | Disconnect from Pi Link and suppress auto-reconnect (overrides `--link`)                                                 |
+| Command             | Purpose                                                                                                                  |
+| ------------------- | ------------------------------------------------------------------------------------------------------------------------ |
+| `/link`             | Show link status (name, role, online count, agent status, context usage, and cwd per terminal)                           |
+| `/link-name [name]` | Rename and save as this session's preferred link name. With no argument, adopts the Pi session name. Restored on resume. |
+| `/link-connect`     | Connect to Pi Link (works anytime, with or without `--link`)                                                             |
+| `/link-disconnect`  | Disconnect from Pi Link and suppress auto-reconnect (overrides `--link`)                                                 |
 
 ### Examples
 
@@ -361,9 +337,6 @@ The four tools compose into coordination shapes worth naming:
 
 > /link-name
 ✓ Renamed to "my-session"
-
-> /link-broadcast starting the build pipeline
-✓ Broadcast sent
 
 > /link-disconnect
 ✓ Disconnected from link
@@ -410,9 +383,11 @@ The discovery sequence runs on startup (with `--link` or `pi-link`) or when `/li
 
 The sequence is a simple fallback:
 
-1. Attempt to connect as a **client** to `127.0.0.1:9900`.
+1. Attempt to connect as a **client** to `127.0.0.1:9900`. The WebSocket opening handshake is bounded at **5 seconds**; a listener that accepts the connection but never completes the upgrade fails the attempt instead of holding it open.
 2. If connection fails → become the **hub** (start a WebSocket server on that port).
 3. If both fail (rare race condition) → retry after a randomized 2-5 second backoff.
+
+Only **one attempt runs at a time**, across both steps. Startup, a retry and `/link-connect` arriving while an attempt is in flight all join that attempt rather than opening a second connection, so a terminal cannot register twice or leave a second socket behind.
 
 ### Hub Promotion
 
@@ -426,17 +401,15 @@ There is **no explicit leader election** - promotion is race-based.
 
 ### Port 9900 is already in use
 
-If another process occupies port 9900, the terminal can't become the hub. It will attempt to connect as a client instead (which also fails if there's no real hub), then retry after 2-5 seconds. Free the port or modify `DEFAULT_PORT` in `index.ts` - see [Limitations](#limitations--design-decisions).
+If another process occupies port 9900, the terminal can't become the hub. It tries to connect as a client first, and that attempt fails within 5 seconds even against a listener that accepts the connection and never speaks WebSocket - so the terminal falls back to trying the hub role and then retries after 2-5 seconds, rather than sitting offline indefinitely. Free the port or modify `DEFAULT_PORT` in `index.ts` - see [Limitations](#limitations--design-decisions).
 
-### "Terminal is busy" rejections
+### `link_compact` reports a busy target
 
-Each terminal handles **one remote operation at a time** — a local agent run, an incoming `link_prompt`, or a `link_compact` all block the others. If a `link_prompt` arrives while the terminal is busy, it's immediately rejected with `"Terminal is busy"`. There is no queuing. Solutions:
+A `link_compact` request does not interrupt work the target is still doing, so it declines while that terminal is unsettled — see [`link_compact`](#link_compact) for the full list of what counts. Try again once `/link` or `link_list` reports the target idle, keeping in mind that idle is what was true a moment ago, not a reservation: the target can start working again before your request lands. `link_send` is different — it enters or steers the target's reasoning instead of declining just because it is busy.
 
-- Wait for the target terminal to finish its current task.
-- Spread prompts across multiple worker terminals.
-- Have the sender retry after a delay.
+### I sent a message but got no reply
 
-A `link_compact` to a busy target behaves the same way — the call resolves with `Compact on "<target>" not done: busy` instead of interrupting active work. Retry when `link_list` shows the worker idle.
+A successful send is not a confirmation. On a client it means the message was handed to the hub connection, not that the target received it or acted on it — and replies are ordinary messages the other agent chooses to send, so nothing produces one automatically. Run `/link`, or ask your model to call `link_list`, and check the target: confirm the name is still exactly right, and note that a target in the `compacting` state holds messages that reach it until that state clears. Otherwise silence may mean the work is still running or that no reply was sent.
 
 ### Terminals don't see each other
 
@@ -446,22 +419,21 @@ A `link_compact` to a busy target behaves the same way — the call resolves wit
 
 ### Hub promotion loses state
 
-When the hub goes down and a client promotes itself, terminal names and in-flight prompts from the old hub session are lost. All surviving clients reconnect and re-register. This is by design - see [Limitations](#limitations--design-decisions).
+When the hub goes down and a client promotes itself, terminal names and in-flight messages from the old hub session may be lost. All surviving clients reconnect and re-register. This is by design - see [Limitations](#limitations--design-decisions).
 
 ---
 
 ## Limitations & Design Decisions
 
-| #   | Decision                                  | Rationale / Impact                                                                                                                                                                                              |
-| --- | ----------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| 1   | **No authentication**                     | Any localhost process can connect to port 9900. Acceptable for local dev; don't expose the port externally.                                                                                                     |
-| 2   | **Hardcoded port (9900)**                 | Not configurable without editing `DEFAULT_PORT` in `index.ts`. Could conflict with other services on the same port.                                                                                             |
-| 3   | **Race-based hub promotion**              | Non-deterministic. Terminal state (names, in-flight prompts) is lost during promotion. Simple but imperfect.                                                                                                    |
-| 4   | **Single remote prompt per terminal**     | No queuing - immediate rejection if busy. See [`link_prompt`](#link_prompt) and [Troubleshooting](#terminal-is-busy-rejections).                                                                                |
-| 5   | **No message persistence**                | Purely ephemeral WebSocket frames. Messages are lost if the recipient is offline.                                                                                                                               |
-| 6   | **Client rename triggers full reconnect** | Changing a client's name requires a new `register` message, so the client disconnects and reconnects. Hub renames are handled in-place with collision checks.                                                   |
-| 7   | **Single-machine / localhost-only**       | Link only binds to `127.0.0.1`; terminals on different machines cannot join.                                                                                                                                    |
-| 8   | **Rename during prompt loses keepalives** | If the target renames mid-prompt, keepalive resets stop working (pending requests track by name). The final response can still succeed by request ID, but inactivity may false-fire on long tasks after rename. |
+| #   | Decision                                  | Rationale / Impact                                                                                                                                                                                               |
+| --- | ----------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| 1   | **No authentication**                     | Any localhost process can connect to port 9900. Acceptable for local dev; don't expose the port externally.                                                                                                      |
+| 2   | **Hardcoded port (9900)**                 | Not configurable without editing `DEFAULT_PORT` in `index.ts`. Could conflict with other services on the same port.                                                                                              |
+| 3   | **Race-based hub promotion**              | Non-deterministic. Terminal names and in-flight ephemeral messages can be lost during promotion. Simple but imperfect.                                                                                           |
+| 4   | **No offline backlog**                    | A definitely absent target is rejected, and nothing is stored for later delivery. A terminal that reconnects receives no messages it missed while offline.                                                       |
+| 5   | **Client rename triggers full reconnect** | Changing a client's name requires a new `register` message, so the client disconnects and reconnects. Hub renames are handled in-place.                                                                          |
+| 6   | **Single-machine / localhost-only**       | Link only binds to `127.0.0.1`; terminals on different machines cannot join.                                                                                                                                     |
+| 7   | **Callbacks are conventional**            | Async work results are uncorrelated messages, not protocol responses. A send carries no request identifier, nothing correlates a reply to it, and a callback exists only because the receiver chose to send one. |
 
 ---
 
@@ -481,36 +453,13 @@ When the hub goes down and a client promotes itself, terminal names and in-fligh
 
 ### Provided by Pi (no install needed)
 
-| Package                           | Purpose                                          |
-| --------------------------------- | ------------------------------------------------ |
-| `@earendil-works/pi-coding-agent` | Pi SDK types (ExtensionAPI, ExtensionContext)    |
-| `@earendil-works/pi-tui`          | TUI Text widget for custom message rendering     |
-| `typebox`                         | JSON Schema type definitions for tool parameters |
+| Package                           | Purpose                                                     |
+| --------------------------------- | ----------------------------------------------------------- |
+| `@earendil-works/pi-coding-agent` | Pi SDK types (ExtensionAPI, ExtensionContext) and `VERSION` |
+| `@earendil-works/pi-tui`          | TUI Text widget for custom message rendering                |
+| `typebox`                         | JSON Schema type definitions for tool parameters            |
 
-> **Pi version requirement:** pi-link 0.1.15+ requires Pi 0.74 or later (the `@earendil-works/*` namespace). Users on Pi 0.73 or earlier should pin `pi-link@0.1.14`.
-
-### `package.json`
-
-```json
-{
-  "name": "pi-link",
-  "bin": {
-    "pi-link": "./bin/pi-link.mjs"
-  },
-  "dependencies": {
-    "ws": "^8.20.0"
-  },
-  "devDependencies": {
-    "@types/ws": "^8.18.1"
-  },
-  "pi": {
-    "extensions": ["./index.ts"],
-    "skills": ["./skills"]
-  }
-}
-```
-
-`pi.extensions` tells Pi which files to load as extensions. `pi.skills` registers bundled skill directories. `bin` exposes the `pi-link` CLI (see [Configuration](#configuration)).
+> See [Prerequisites](#prerequisites) for supported Pi versions.
 
 ---
 
@@ -520,21 +469,19 @@ When the hub goes down and a client promotes itself, terminal names and in-fligh
 
 ### Protocol
 
-The wire protocol consists of **11 message types**, all serialized as JSON over WebSocket frames. Cwd and context fields are optional.
+The wire protocol consists of the following message types, all serialized as JSON over WebSocket frames. Cwd and context fields are optional.
 
-| Type               | Direction       | Purpose                                                                             |
-| ------------------ | --------------- | ----------------------------------------------------------------------------------- |
-| `register`         | Client → Hub    | First message after connecting; requests a name, optionally reports cwd and context |
-| `welcome`          | Hub → Client    | Confirms assigned name, terminal list + status/cwd/context snapshots                |
-| `terminal_joined`  | Hub → All       | Broadcast when a terminal joins; may include cwd and context                        |
-| `terminal_left`    | Hub → All       | Broadcast when a terminal disconnects                                               |
-| `chat`             | Any → Any/All   | Fire-and-forget message; optionally triggers LLM turn                               |
-| `prompt_request`   | Any → Any       | Request a remote terminal to execute a prompt                                       |
-| `prompt_response`  | Any → Any       | Response carrying the remote prompt result                                          |
-| `compact_request`  | Any → Any       | Request a remote terminal to compact its context; awaits a response                 |
-| `compact_response` | Any → Any       | Completion/failure response for a compact_request                                   |
-| `status_update`    | Any → Hub → All | Terminal broadcasts agent status change; carries updated context                    |
-| `error`            | Hub → Client    | Error notification                                                                  |
+| Type               | Direction       | Purpose                                                                                             |
+| ------------------ | --------------- | --------------------------------------------------------------------------------------------------- |
+| `register`         | Client → Hub    | First message after connecting; requests a name, optionally reports cwd and context                 |
+| `welcome`          | Hub → Client    | Confirms assigned name, terminal list + status/cwd/context snapshots                                |
+| `terminal_joined`  | Hub → All       | Broadcast when a terminal joins; may include cwd and context                                        |
+| `terminal_left`    | Hub → All       | Broadcast when a terminal disconnects                                                               |
+| `chat`             | Any → Any       | Message delivered to the receiver's model: steered into a running agent, or starting a turn if idle |
+| `compact_request`  | Any → Any       | Request a remote terminal to compact its context; awaits a response                                 |
+| `compact_response` | Any → Any       | Completion/failure response for a compact_request                                                   |
+| `status_update`    | Any → Hub → All | Terminal broadcasts agent status change; carries updated context                                    |
+| `error`            | Hub → Client    | Error notification                                                                                  |
 
 ### Message Flow Examples
 
@@ -567,28 +514,13 @@ Client A            Hub              Client B
   |                  |                  |
 ```
 
-**Remote prompt (synchronous RPC):**
-
-```
-Client A            Hub              Client B
-  |                  |                  |
-  | prompt_request   |                  |
-  |----------------->|                  |
-  |                  | prompt_request   |
-  |                  |----------------->|
-  |                  |   (LLM runs)     |
-  |                  |<-----------------|
-  | prompt_response  |                  |
-  |<-----------------|                  |
-```
-
 ### Name Uniqueness & Persistence
 
 The hub enforces unique terminal names via a `uniqueName()` function. If `"builder"` is already taken, the next terminal requesting that name is assigned `"builder-2"`, then `"builder-3"`, and so on.
 
 Default names are random 4-character hex IDs: `t-a1b2`, `t-c3d4`, etc.
 
-**Persistence:** `/link-name` saves the preferred name to the session via `pi.appendEntry("link-name", { name })`. On session resume, the saved name is restored and requested from the hub. Only explicit `/link-name` calls persist - hub-assigned variants like `"builder-2"` are not saved. On reconnect, the terminal always requests the preferred name, not the last runtime name.
+**Persistence:** `/link-name` saves the preferred name to the session via `pi.appendEntry("link-name", { name })`. On session resume, the saved name is restored and requested from the hub. Startup naming (`pi-link <name>`, `pi --link-name <name>`) persists the same way - hub-assigned variants like `"builder-2"` are not saved. On reconnect, the terminal always requests the preferred name, not the last runtime name.
 
 **Rename guards:**
 
@@ -600,26 +532,29 @@ Default names are random 4-character hex IDs: `t-a1b2`, `t-c3d4`, etc.
 
 ### State Management
 
-| State Field              | Type                                  | Purpose                                                                                     |
-| ------------------------ | ------------------------------------- | ------------------------------------------------------------------------------------------- |
-| `role`                   | `"hub" \| "client" \| "disconnected"` | Current network role                                                                        |
-| `agentRunning`           | `boolean`                             | Whether an agent run is active; blocks incoming remote prompts                              |
-| `activeToolName`         | `string \| null`                      | Name of the currently executing tool (drives `tool:<name>` status)                          |
-| `stateSince`             | `number`                              | Timestamp of last status change (used for duration display)                                 |
-| `currentCwd`             | `string`                              | Current working directory reported to peers on connect                                      |
-| `inbox`                  | `array`                               | Queued `triggerTurn:true` messages awaiting idle-gated flush                                |
-| `flushTimer`             | `Timer \| null`                       | Pending inbox flush (debounce or busy-retry)                                                |
-| `disposed`               | `boolean`                             | Set on `session_shutdown`; guards all WebSocket callbacks against stale context             |
-| `startupConnectTimer`    | `Timer \| null`                       | Deferred startup connect (`setTimeout(0)`) so Pi's startup cycle completes first            |
-| `manuallyDisconnected`   | `boolean`                             | Set by `/link-disconnect`; suppresses auto-reconnect                                        |
-| `pendingRemotePrompt`    | `object \| null`                      | Tracks the single in-flight remote prompt execution                                         |
-| `pendingPromptResponses` | `Map`                                 | Outstanding prompt RPCs awaiting responses (includes inactivity + ceiling timers per entry) |
+| State Field               | Type                                  | Purpose                                                                                                                     |
+| ------------------------- | ------------------------------------- | --------------------------------------------------------------------------------------------------------------------------- |
+| `role`                    | `"hub" \| "client" \| "disconnected"` | Current network role                                                                                                        |
+| `connectionAttempt`       | `record \| null`                      | The one establishment attempt in flight: its shared promise plus any pending socket/server. Object identity marks the owner |
+| `agentRunning`            | `boolean`                             | Between `agent_start` and `agent_settled` — not `agent_end`; drives status only                                             |
+| `compactRunning`          | `boolean`                             | Whether a remote request holds this terminal's delivery gate                                                                |
+| `localCompacting`         | `boolean`                             | Whether a `manual`-reason compaction has raised the delivery gate                                                           |
+| `activeTools`             | `Map`                                 | `toolCallId` → `toolName` for calls still running; the first drives status                                                  |
+| `stateSince`              | `number`                              | Timestamp of last status change (used for duration display)                                                                 |
+| `currentCwd`              | `string`                              | Current working directory reported to peers on connect                                                                      |
+| `inbox`                   | `array`                               | Queued incoming messages awaiting delivery                                                                                  |
+| `flushTimer`              | `Timer \| null`                       | Pending inbox flush; armed by the first queued message and not moved afterwards                                             |
+| `compactDeadline`         | `Timer \| undefined`                  | Backstop releasing the inbox if a compaction reports no ending                                                              |
+| `pendingCompactResponses` | `Map`                                 | Outstanding compact requests awaiting bounded responses                                                                     |
+| `disposed`                | `boolean`                             | Set on shutdown; guards WebSocket callbacks against stale context                                                           |
+| `startupConnectTimer`     | `Timer \| null`                       | Deferred startup connect so Pi's startup cycle completes first                                                              |
+| `manuallyDisconnected`    | `boolean`                             | Set by `/link-disconnect`; suppresses auto-reconnect                                                                        |
 
 ### Message Routing & Error Handling
 
 `routeMessage()` returns a `boolean` indicating delivery status:
 
-- **Hub** - delivery is authoritative. If the target terminal isn't connected, the hub sends a protocol-level error back to the sender. For `prompt_request` messages to unknown targets, the hub sends a `prompt_response` with an error field so the sender's pending promise resolves immediately rather than timing out. Likewise, a `compact_request` to an unknown target gets a synthesized `compact_response` (`ok: false`, `reason: "not_found"`), so a remote-compact call fails fast instead of waiting out its 180-second timeout.
+- **Hub** - delivery is authoritative. If a chat target is not connected, the hub sends a protocol-level error back to a client sender; a local hub sender already receives the failed delivery result. A `compact_request` to an unknown target gets a synthesized `compact_response` (`ok: false`, `reason: "not_found"`), so the bounded compact call fails fast.
 - **Client** - delivery is optimistic (`true` means "sent to hub"). The hub handles routing and errors via the protocol.
 
 ### Connection Lifecycle
@@ -637,44 +572,50 @@ Three helpers protect WebSocket callbacks from stale extension context:
 
 Startup connect is deferred via `scheduleStartupConnect()` (`setTimeout(0)`) so Pi's startup cycle completes and the extension context is fully valid before WebSocket work begins.
 
+`disconnect()` also cancels the connection attempt in flight: it invalidates the attempt first, then closes whatever it had pending - a dialing socket or a binding server - so nothing can finish establishing after the user asked to disconnect. The startup and retry timers are cancelled on the same path, so `/link-disconnect` before the deferred startup connect opens nothing at all. Because ownership is tracked per attempt, a callback from a superseded or cancelled transport is inert: only the established socket (`ws`) may deliver messages or tear down client state, and only the established server (`wss`) may accept clients.
+
 The `manuallyDisconnected` flag distinguishes user-initiated disconnects (`/link-disconnect`) from connection loss. When set, `scheduleReconnect()` is suppressed - the terminal stays offline until `/link-connect` is explicitly called.
 
 ### Agent Lifecycle Integration
 
 The extension hooks into Pi's agent lifecycle events:
 
-- **`agent_start`** → Sets `agentRunning = true`, blocking incoming remote prompts. Broadcasts `status_update` (`thinking`).
-- **`agent_end`** → Wakes up the inbox flush (idle-gated delivery for `triggerTurn:true` messages). Checks if a remote prompt was running; if so, extracts the last assistant response from `event.messages` and sends back a `prompt_response`. Broadcasts `status_update` (`idle`).
-- **`tool_execution_start`** → Broadcasts `status_update` (`tool:<name>`).
-- **`tool_execution_end`** → Clears tool status; broadcasts `status_update` (`thinking`) while the agent run continues.
-- **`session_compact`** → Force-pushes a `status_update` so peers see the new (post-compaction) context usage immediately.
+- **`agent_start`** → Sets `agentRunning = true`, which drives status. Clears the local compaction gate - safe only under the current deployment, not by Pi alone: Pi refuses to start an ordinary prompt during a manual compaction, and pi-link holds back the one delivery path that refusal does not cover, so nothing can start a run mid-compaction. Another extension starting a turn during one would void that. Also drops any tool calls left recorded; status normally becomes `thinking`.
+- **`agent_end`** → Drops any tool calls still recorded, so an unmatched one falls back to `thinking` instead of staying pinned. It deliberately does **not** end the run: Pi may still retry, compact automatically, or drain a queued continuation, so the status stays `thinking`.
+- **`agent_settled`** → The authoritative end of a run: Pi emits it once no retry, compaction or queued continuation is left. Status becomes `idle` — unless the event's context reports Pi busy again, which means another extension started a new run during settlement, and that newer run keeps reporting `thinking`.
+- **`tool_execution_start`** → Records that call. It is displayed unless an earlier call is still running.
+- **`tool_execution_end`** → Drops that one call. The display stays `tool:<name>` while other calls remain, moves to the next call when the displayed one ends, and returns to `thinking` after the last one while the agent run continues.
+- **`session_before_compact`** → For a manual compaction, raises the gate that holds inbox delivery. Automatic (threshold/overflow) compaction is left alone: it runs inside the agent run, where Pi already queues and drains steered messages itself.
+- **`session_compact`** → Clears the local compaction gate and force-pushes a `status_update` so peers see the new (post-compaction) context usage immediately.
 - **`session_shutdown`** → Full cleanup via `cleanup()`: closes all sockets, resolves pending promises, and disposes the extension.
 
-Status updates are push-based: each terminal broadcasts changes to the hub, which fans them out. New joiners receive a status snapshot for all terminals in the `welcome` message.
+The five agent and tool handlers — `agent_start`, `agent_end`, `agent_settled`, `tool_execution_start`, `tool_execution_end` — each recompute the status and hand it to `pushStatus()`, which publishes only when the status identity differs from the stored baseline of the last published identity. While a baseline is stored, a mutation leaving the display identical is therefore silent: a second tool starting behind the one already shown publishes nothing, and because a raised compaction gate outranks every other state, mutations beneath it publish nothing either. `disconnect()` clears that baseline. Once connected again, whichever comes first restores it: a forced push, such as the one a client makes on `welcome`, or the first of these handler events. So a handler event republishes an unchanged identity only when no forced push got there first — the case for a promoted hub, which receives no `welcome` of its own. The three session handlers are governed by their own bullets above, including `session_compact`'s forced push, which goes out whether the identity changed or not.
 
-While executing a remote prompt, the target sends a forced `status_update` every 30 seconds as a keepalive - reusing the existing status push mechanism. On the sender side, each incoming `status_update` from the target resets the 90-second inactivity timer. All resolution paths (response, inactivity, ceiling, abort, disconnect, delivery failure) go through a single `cleanupPending()` helper to prevent double-resolution races.
+Status updates are push-based: each terminal broadcasts changes to the hub, which fans them out. New joiners receive a status snapshot for all terminals in the `welcome` message. Context updates reuse the same status path, including a forced post-compaction update.
 
-### Idle-Gated Inbox
+### Inbox
 
-When a `chat` message arrives with `triggerTurn:true`, it goes into a local inbox instead of calling `pi.sendMessage()` immediately. This avoids a Pi platform race where steering messages sent mid-agent-run can be stranded (see `REPORT-sendMessage-race.md`).
+An arriving `chat` message goes into a local inbox rather than calling `pi.sendMessage()` immediately, so that arrivals close together can be coalesced into a single delivery.
 
 The flush pipeline:
 
-1. **Debounce** - `scheduleFlush(FLUSH_DELAY_MS)` coalesces burst arrivals (200ms window).
-2. **Idle gate** - `flushInbox()` checks `ctx.isIdle()`. If busy, retries every 500ms.
+1. **Fixed window** - `scheduleFlush(FLUSH_DELAY_MS)` arms a timer only when none is pending, so the first queued message sets the deadline (about 200ms) and later arrivals join that window without moving it. The window is not sliding: sustained arrivals closer together than the delay cannot postpone delivery.
+2. **Compaction gate** - `flushInbox()` returns without rescheduling while the compaction gate is raised.
 3. **Batch** - up to 20 messages or ~16 000 chars per delivery (soft cap - the first item is always included even if oversized).
-4. **Deliver** - one `pi.sendMessage({ triggerTurn: true })` call with a `[Link: N message(s) received]` block.
+4. **Deliver** - one `pi.sendMessage()` call with a `[Link: N message(s) received]` block. Pi reads the receiver's state at this point — not at send time — to decide whether the batch steers a running agent or starts a turn.
 5. **Drain** - if the inbox still has items, reschedule.
 
-On `agent_end`, the inbox flush is kicked via `scheduleFlush(0)` - deferred to the next macrotask, by which time `ctx.isIdle()` returns `true`.
+Delivery is held while a `manual`-reason compaction holds this terminal's gate, because a message delivered mid-compaction would be reasoned about against context that is being rebuilt. Two flags gate it: `compactRunning` for a compaction serving a remote `link_compact`, and `localCompacting`, set from `session_before_compact`. A human `/compact` aborts and prepares before Pi emits that event, so the gate rises a moment after the compaction starts; a flush in that gap can still start a turn, and the message itself survives. A remote request raises both, since Pi reports its own reason as `manual` either way. Automatic (threshold/overflow) compaction is deliberately **not** gated: it runs inside the agent run, where Pi already queues steered messages and drains them afterwards.
 
-| Constant          | Value  | Purpose                                  |
-| ----------------- | ------ | ---------------------------------------- |
-| `FLUSH_DELAY_MS`  | 200    | Burst debounce window                    |
-| `IDLE_RETRY_MS`   | 500    | Busy-retry polling interval              |
-| `BATCH_MAX_ITEMS` | 20     | Max messages per batch                   |
-| `BATCH_MAX_CHARS` | 16 000 | Soft cap on batch text size (~4K tokens) |
+Because a gated flush does not reschedule, the release path is load-bearing. `releaseInbox()` is called after either flag clears and schedules a flush only when neither gate remains — so a remote compaction's `session_compact` calls it and correctly does nothing, and the later `finish()` is what drains. `compactDeadline` is the backstop, since a failed compaction reports no ending to an extension at all.
+
+| Constant             | Value   | Purpose                                          |
+| -------------------- | ------- | ------------------------------------------------ |
+| `FLUSH_DELAY_MS`     | 200     | Batching window, from the first queued message   |
+| `BATCH_MAX_ITEMS`    | 20      | Max messages per batch                           |
+| `BATCH_MAX_CHARS`    | 16 000  | Soft cap on batch text size (~4K tokens)         |
+| `COMPACT_TIMEOUT_MS` | 180 000 | Remote-compact wait, reused as the gate backstop |
 
 ### Rendering
 
-Incoming link chat messages render with a styled `⚡ [sender]` prefix using the theme's accent color. The link status text in Pi's footer uses `theme.fg("dim", ...)` to match Pi's standard footer styling.
+Delivered link batches render with a styled `⚡ [link]` prefix using the theme's accent color; sender attribution lives in the `From "name":` blocks inside the message body, not in the prefix. The link status text in Pi's footer uses `theme.fg("dim", ...)` to match Pi's standard footer styling.

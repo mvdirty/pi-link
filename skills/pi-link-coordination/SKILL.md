@@ -1,114 +1,124 @@
 ---
 name: pi-link-coordination
-description: Guidance for coordinating work across Pi terminals using pi-link. Use when delegating tasks, choosing between link_prompt and link_send, planning async vs sync work, batching parallel jobs, managing a remote terminal's context with link_compact, or avoiding busy/conflict patterns.
+description: Mechanics of coordinating work across Pi terminals with link_send, link_list, and link_compact — how delivery, batching, callbacks, and remote compaction actually behave.
 ---
 
 # Pi-Link Coordination
 
-How to coordinate work across Pi terminals via pi-link.
+How the pi-link transport behaves between Pi terminals.
 
-Each terminal is an independent agent: they share no memory or conversation history — link only passes messages and prompts between them. Anything a remote terminal needs — file paths, task state, expected output, where to send its callback — must be in the message itself.
-
----
-
-## Tool Selection Rule
-
-- Need the answer back now? → `link_prompt`
-- Need autonomous work done? → `link_send(triggerTurn: true)`
-- Need to notify only? → `link_send(triggerTurn: false)`
-- Need to free a terminal's context? → `link_compact`
+**Terminals share no conversation.** Each is an independent agent with its own
+context. Nothing you hold — task state, file paths, an approval you were given,
+what you decided a moment ago — is visible to a terminal you message. The message
+is the entire shared state.
 
 ---
 
-## The Golden Rule
-
-> After `link_send(triggerTurn: true)` to terminal X, do not `link_prompt` X until X sends a completion callback.
-
-The `DONE` / `BLOCKED` callback arrives as a normal later user message; treat that callback as the signal that it is safe to send a follow-up `link_prompt`.
-
-Pick one mode per terminal per task. Mixing sync and async on the same terminal is a common coordination failure.
-
----
-
-## The Tools
+## Tools
 
 ### `link_list`
 
-Returns connected terminals with names, live status (`idle`, `thinking`, `tool:<name>`), and working directory (cwd). Some terminals also report context usage as `45K/272K (17%)` — how full that window is: high usage means less room remaining, though a loaded terminal may also be the one already holding the relevant task state. Your own entry is marked `(you)` — use this to discover your link name when replying to broadcast tasks.
+Returns connected terminals with names, status (`idle`, `thinking`,
+`compacting`, `tool:<name>`), cwd, and (when available) context usage such as
+`45K/272K (17%)`. Your own entry is marked `(you)`; its status and context are
+computed when listed, while peer values are their latest published snapshots.
 
-Only currently connected terminals are visible. If a target is missing, it is offline; messages to offline terminals are not queued.
+Pi runs tools in parallel by default, and `tool:<name>` then names the first
+still-active call it reported rather than all of them. It advances only when that
+call ends, and becomes `thinking` only after the last call ends.
 
-### `link_prompt`
+`thinking` covers every kind of unsettled work, not just an LLM call: an automatic
+retry, an automatic compaction and a queued continuation all run after the visible
+turn ends, and the terminal reads `thinking` until Pi reports the run settled.
 
-Synchronous RPC. Send a prompt, wait for the response.
+`compacting` means a manual compaction has raised that terminal's delivery gate;
+messages sent to it wait until the gate clears. An automatic (threshold or
+overflow) compaction never shows it — it is not gated, and reads `thinking` like
+the rest of the run it belongs to.
 
-- Fails fast if the target is yourself, not connected, or busy (local work, another remote prompt, or compaction); a mid-wait disconnect resolves as an error
-- 90s inactivity timeout, 30min hard ceiling
-- Remote agent doesn't share your context — include enough detail to complete the task
+Only connected terminals are visible; nothing is stored for disconnected
+terminals, so a reconnecting terminal receives no backlog.
+
+A terminal's queued messages are invisible to you, and silence is
+indistinguishable from work in progress.
 
 ### `link_send`
 
-Fire-and-forget. Send to one terminal or `to: "*"` to broadcast to every other connected terminal; there is no exclusion filter. Sending to yourself is rejected. A send to a name that isn't connected fails with an error listing who _is_ connected — delivery failure is visible to the sender, not silent.
+The message is delivered to the receiver's model. The first message to arrive opens
+a batching window of about 200ms; later arrivals do not move its deadline, so a
+steady stream is delivered window by window instead of waiting for a pause. A batch
+arrives as one `[Link: N message(s) received]` block, in arrival order, containing
+one `From "name":` block per message.
 
-Set `triggerTurn: true` to queue async work on the receiver. The sender does **not** get an automatic response back.
+The receiver's state is read when that batch is delivered, not when you send and
+not when you last ran `link_list`. If the receiver is still running then, the batch
+is steered into that run at Pi's next safe boundary — current tool calls finish
+first, before the next LLM call. Otherwise it starts a turn. A receiver can settle
+within the delay, so a message sent to a busy terminal may still arrive as a new
+turn. There is no way to send without entering the receiver's reasoning.
 
-Delivery shape depends on the message's `triggerTurn`:
+Each send has exactly one recipient. There is no fan-out.
 
-- **`triggerTurn: true`** messages go through the receiver's idle-gated inbox and surface at a turn boundary wrapped as `[Link: N message(s) received]` followed by one `From "name":` block per message. Multiple pending messages are batched into one turn.
-- **`triggerTurn: false`** messages bypass the inbox and surface directly as raw content — no wrapper, no `From` block. The receiver sees only the message text, so the sender must include their own identity, task tag, or artifact paths in the body.
+The call returns send status, not the receiver's eventual work result. A definitely
+absent target fails against the local terminal list; beyond that, for a client a
+successful send means the message was written to its hub connection, not that it
+arrived. If the target has vanished, the routing failure is shown to the human as a
+notification and never reaches the sending model.
 
-**Callback convention for `triggerTurn: true`:** the sender gets no automatic response, so ask the receiver to report back via `link_send(..., triggerTurn: true)` (which lands at a proper turn boundary with the wrapper intact). A useful convention:
-
-- `DONE` / `BLOCKED`
-- Output paths / artifacts created
-- Result summary or next question
-
-Use `triggerTurn: false` for fire-and-forget status notifications only — when you don't need to act on the reply.
-
-**Receiver rule:** If your turn opens with `[Link: N message(s) received]`, treat each `From "name":` block as assigned work. When done, send the sender a `DONE` / `BLOCKED` callback via `link_send(..., triggerTurn: true)` — unless the task says otherwise.
+A terminal reported as `compacting` receives nothing until its gate clears. The
+messages wait and are delivered afterwards. A cancelled compaction has no ending
+pi-link can see, so they wait for the terminal's next agent run, a later
+successful compaction, or a three-minute deadline — whichever comes first. The
+sender is told nothing meanwhile.
 
 ### `link_compact`
 
-Blocks until the target finishes compacting, then returns (3 min ceiling — the call then errors for you, though the target may still finish compacting on its own; check it before assuming failure). Ask another terminal to compact its context window into a summary, freeing space. `link_list` exposes context usage; `link_compact` is the lever when you decide a terminal should free context — and because the call only returns once compaction is done, you can immediately hand it more work with `link_send`/`link_prompt` (no sleep, no busy-bounce). Busy targets (mid-turn or already compacting) decline; retry when `link_list` shows them idle. You decide the threshold; pi-link just runs the compaction you ask for. Its optional `instructions` add an extra focus to that summary.
+Asks another terminal to compact its context and waits for a result, with a
+three-minute ceiling. A target accepts only when Pi reports its session idle and no
+manual compaction holds its gate; anything else declines rather than being
+interrupted, so a target reading `thinking` for a retry or an automatic compaction
+declines exactly as one mid-turn does. Optional `instructions` focus the summary.
+
+The timeout bounds your wait only. Nothing aborts the target, so a timed-out call
+may mean the compaction is still running.
+
+Compaction discards detail. What survives is whatever the summary keeps, so
+anything the target learned but has not written down or reported can be lost.
 
 ---
 
-## Operating Constraints
+## Callbacks
 
-- **One remote prompt at a time per target.** Concurrent requests rejected as busy.
-- **Messages are ephemeral.** Offline terminals lose messages.
-- **Localhost only.** Same machine.
-- **Cwd is a hint, not proof.** Same cwd ≠ same workspace/branch/access. Use explicit paths; absolute when cwds differ or shared-root assumptions are unclear.
-- **Naming:** Link names are user-defined identities (often `role@domain`, e.g. `builder@pi-link`); the hub keeps them unique, suffixing collisions (`builder@pi-link-2`). Use `link_list` to confirm a target's exact name, and its cwd to tell similar-named terminals apart.
+A callback is an ordinary `link_send` from the worker back to you. There is no
+request ID, no automatic response, no delivery receipt, and no protocol timeout —
+nothing correlates a callback with the dispatch that asked for it except the text
+of both, and nothing produces one except the receiver choosing to send it.
 
----
+Waiting for one requires no live run: if the terminal is idle when the batch is
+delivered, the message starts a turn by itself. Keeping a run alive only to wait —
+by sleeping or polling `link_list` — is unnecessary and can postpone delivery to
+the model until active tool calls end.
 
-## Parallel batch
+A callback can be sent before its sender's run settles; receiving it does not
+prove the sender is idle, so a `link_compact` aimed at it can still decline as
+busy.
 
-`link_send(triggerTurn: true)` can dispatch independent tasks to several terminals at once. Their callbacks may arrive separately or batched into one turn when you next become idle — track which workers are still outstanding. Each task must be self-contained (explicit paths, absolute if cwds differ). Don't `link_prompt` a dispatched terminal until its callback arrives (Golden Rule).
-
----
-
-## Anti-Patterns
-
-**❌ Mixing async and sync on the same terminal**
-Dispatched with `link_send(triggerTurn: true)` then sent a `link_prompt` → rejected as busy. See Golden Rule.
-
-**❌ No completion callback on async work**
-`triggerTurn: true` returns no result to the sender — without an agreed callback you never learn the outcome.
-
-**❌ Circular delegation**
-A → B → C → A won't complete — the cycle-closing `link_prompt` hits a busy target (rejected), and an async `link_send` cycle just loops. Keep delegation acyclic.
+An accepted send does not wait for a reply, so several tasks can be dispatched
+before any callback arrives, and callbacks may arrive separately or batched into
+one of your turns. For the same reason the protocol supplies no exit condition for
+an A → B → C → A delegation chain.
 
 ---
 
-## Quick Reference
+## Constraints
 
-| I need to...                     | Tool                            | Mode             |
-| -------------------------------- | ------------------------------- | ---------------- |
-| See who's available              | `link_list`                     | —                |
-| Get an answer from another agent | `link_prompt`                   | Synchronous      |
-| Delegate autonomous work         | `link_send(triggerTurn: true)`  | Asynchronous     |
-| Notify without activating        | `link_send(triggerTurn: false)` | Fire-and-forget  |
-| Broadcast to all                 | `link_send(to: "*")`            | Broadcast        |
-| Free a loaded worker's context   | `link_compact`                  | Await-completion |
+- **Localhost only.** All terminals run on the same machine.
+- **Cwd is a hint, not proof.** Same cwd does not prove the same workspace, branch,
+  or access. Paths named in a message are only text: they do not change the
+  receiver's cwd, and relative commands resolve from the receiver's own cwd.
+- **Names are identities.** The hub suffixes collisions, so the name you remember
+  may not be the name that is connected; `link_list` shows the current one.
+- **Mixed-version meshes are unsupported.** Across the current protocol break, a
+  message from a new sender can reach a 0.2.0 receiver as bare text — without the
+  `[Link: N message(s) received]` header or the `From "name":` line — and nothing
+  reports a fault.

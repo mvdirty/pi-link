@@ -71,25 +71,42 @@ function resolveSessionDir(cwd, agentDir) {
 }
 
 // Reads a session JSONL file and returns its display name, cwd, id, link
-// status, and message count.
+// status, and message count. Returns null when `scopeCwd` is given and the
+// session's header names a different cwd.
 //
 // Name precedence: latest valid `link-name` custom entry wins as the
 // authoritative pi-link name. `session_info.name` is only a fallback for
 // sessions that never set a link-name. Historical link-names are not aliases.
-async function getSessionMeta(filePath) {
+//
+// A scoped scan only ever keeps sessions from `scopeCwd`, so a session whose
+// header names another cwd is abandoned there instead of being read to EOF for
+// a name that would be filtered out anyway. Pi writes that header as the first
+// complete line of the file, before any history.
+//
+// Only `undefined` means unscoped: a normalized scope is the empty string at
+// POSIX root, which is a real scope and must not read as "no scope".
+async function getSessionMeta(filePath, scopeCwd) {
   let linkName;
   let sessionName;
   let cwd;
   let id;
   let hasLinkName = false;
   let messages = 0;
-  const rl = createInterface({ input: createReadStream(filePath, "utf-8"), crlfDelay: Infinity });
+  const input = createReadStream(filePath, "utf-8");
+  const rl = createInterface({ input, crlfDelay: Infinity });
   for await (const line of rl) {
     if (!line) continue;
     try {
       const entry = JSON.parse(line);
       if (entry.type === "session") {
-        if (typeof entry.cwd === "string") cwd = entry.cwd;
+        if (typeof entry.cwd === "string") {
+          if (scopeCwd !== undefined && normalizePath(entry.cwd) !== scopeCwd) {
+            rl.close();
+            input.destroy();
+            return null;
+          }
+          cwd = entry.cwd;
+        }
         if (typeof entry.id === "string") id = entry.id;
       } else if (entry.type === "session_info" && typeof entry.name === "string") {
         sessionName = normalizeName(entry.name) || undefined;
@@ -146,9 +163,10 @@ function relTime(d) {
   return d.toISOString().slice(0, 10);
 }
 
-async function loadSessionRecord(filePath) {
+async function loadSessionRecord(filePath, scopeCwd) {
   try {
-    const meta = await getSessionMeta(filePath);
+    const meta = await getSessionMeta(filePath, scopeCwd);
+    if (!meta) return null; // known-foreign: not even worth a stat
     const stats = await stat(filePath);
     return { ...meta, modified: stats.mtime, path: filePath };
   } catch {
@@ -156,11 +174,12 @@ async function loadSessionRecord(filePath) {
   }
 }
 
-// Returns meta + mtime + path for every readable session in `dir`. Custom
-// layout is flat (<dir>/*.jsonl); default layout has one subdir level per
-// encoded cwd (<dir>/<sub>/*.jsonl). Errors on individual files/dirs are
-// silently skipped — active or partially-written sessions are tolerated.
-async function scanSessions(dir, isCustom) {
+// Returns meta + mtime + path for every readable session in `dir`, or only
+// those from `scopeCwd` when it is given. Custom layout is flat
+// (<dir>/*.jsonl); default layout has one subdir level per encoded cwd
+// (<dir>/<sub>/*.jsonl). Errors on individual files/dirs are silently skipped
+// — active or partially-written sessions are tolerated.
+async function scanSessions(dir, isCustom, scopeCwd) {
   let entries;
   try {
     entries = await readdir(dir, { withFileTypes: true });
@@ -172,7 +191,7 @@ async function scanSessions(dir, isCustom) {
   if (isCustom) {
     for (const entry of entries) {
       if (!entry.isFile() || !entry.name.endsWith(".jsonl")) continue;
-      tasks.push(loadSessionRecord(join(dir, entry.name)));
+      tasks.push(loadSessionRecord(join(dir, entry.name), scopeCwd));
     }
   } else {
     for (const sub of entries) {
@@ -182,7 +201,7 @@ async function scanSessions(dir, isCustom) {
       try { files = await readdir(subPath); } catch { continue; }
       for (const file of files) {
         if (!file.endsWith(".jsonl")) continue;
-        tasks.push(loadSessionRecord(join(subPath, file)));
+        tasks.push(loadSessionRecord(join(subPath, file), scopeCwd));
       }
     }
   }
@@ -190,28 +209,28 @@ async function scanSessions(dir, isCustom) {
   return (await Promise.all(tasks)).filter((s) => s !== null);
 }
 
-// Find sessions whose current display name matches `targetName`. Returns both
-// local-cwd matches and all matches (cross-cwd) so the caller can default to
-// local while still surfacing a hint when non-local matches exist. Falls back
-// to `session_info.name` for sessions without a link-name (so `pi-link <name>`
+// Find sessions whose current display name matches `targetName`, restricted to
+// `scopeCwd` when given and searched across every cwd when not. Falls back to
+// `session_info.name` for sessions without a link-name (so `pi-link <name>`
 // can attach link to a previously-unlinked named session).
-async function findSessionsByName(targetName, dir, isCustom) {
-  const localCwd = normalizePath(process.cwd());
-  const all = (await scanSessions(dir, isCustom))
+//
+// The cwd predicate is applied here as well as in the scan: a session whose
+// header carries no cwd is not rejected early, and must still be left out of a
+// scoped result.
+async function findSessionsByName(targetName, dir, isCustom, scopeCwd) {
+  return (await scanSessions(dir, isCustom, scopeCwd))
     .filter((s) => s.name === targetName)
+    .filter((s) => scopeCwd === undefined || (s.cwd && normalizePath(s.cwd) === scopeCwd))
     .map((s) => ({ path: s.path, cwd: s.cwd || "?", modified: s.modified }))
     .sort((a, b) => b.modified.getTime() - a.modified.getTime());
-  const local = all.filter((s) => normalizePath(s.cwd) === localCwd);
-  return { local, all };
 }
 
-// List pi-link sessions (those with at least one link-name entry). Default
-// scope is current cwd; `all` widens to every directory.
-async function listSessions({ all, dir, isCustom }) {
-  const localCwd = normalizePath(process.cwd());
-  return (await scanSessions(dir, isCustom))
+// List pi-link sessions (those with at least one link-name entry), restricted
+// to `scopeCwd` when given and covering every cwd when not.
+async function listSessions({ dir, isCustom, scopeCwd }) {
+  return (await scanSessions(dir, isCustom, scopeCwd))
     .filter((s) => s.hasLinkName)
-    .filter((s) => all || (s.cwd && normalizePath(s.cwd) === localCwd))
+    .filter((s) => scopeCwd === undefined || (s.cwd && normalizePath(s.cwd) === scopeCwd))
     .map((s) => ({
       name: s.name || "(unnamed)",
       cwd: s.cwd || "?",
@@ -481,9 +500,14 @@ switch (state.mode) {
 
 // ── Mode handlers ──────────────────────────────────────────────────────────
 
+// A local operation scans only its own cwd; `--global` scans every cwd.
+function localScope(state) {
+  return state.global ? undefined : normalizePath(process.cwd());
+}
+
 async function runList(state) {
   const { dir, isCustom } = resolveSessionDir(process.cwd(), resolveAgentDir());
-  const sessions = await listSessions({ all: state.global, dir, isCustom });
+  const sessions = await listSessions({ dir, isCustom, scopeCwd: localScope(state) });
   if (sessions.length === 0) {
     console.log(state.global ? "No pi-link sessions found." : "No pi-link sessions found in this cwd.");
     console.log("Start one: pi-link <name>");
@@ -513,8 +537,7 @@ async function runList(state) {
 async function runResolve(state) {
   const name = state.resolveName; // already normalized
   const { dir, isCustom } = resolveSessionDir(process.cwd(), resolveAgentDir());
-  const { local, all } = await findSessionsByName(name, dir, isCustom);
-  const matches = state.global ? all : local;
+  const matches = await findSessionsByName(name, dir, isCustom, localScope(state));
   if (matches.length === 1) {
     process.stdout.write(matches[0].path);
     return; // exit 0
@@ -523,18 +546,17 @@ async function runResolve(state) {
     printCandidates(name, matches); // exits 1
   }
   // matches.length === 0 → not found; exit 2 to distinguish from ambiguous.
+  // A local scan never reads names from other cwds, so the advice is offered
+  // without claiming anything is there.
   console.error(`No session named "${name}" found${state.global ? "" : " in this cwd"}.`);
-  if (!state.global && all.length > 0) {
-    console.error(`(${all.length} match${all.length === 1 ? "" : "es"} in other cwds — try --global to consider ${all.length === 1 ? "it" : "them"}.)`);
-  }
+  if (!state.global) console.error("Use --global to search other cwds.");
   process.exit(2);
 }
 
 async function runLauncher(state) {
   const name = state.launcherName; // already normalized
   const { dir, isCustom } = resolveSessionDir(process.cwd(), resolveAgentDir());
-  const { local, all } = await findSessionsByName(name, dir, isCustom);
-  const matches = state.global ? all : local;
+  const matches = await findSessionsByName(name, dir, isCustom, localScope(state));
   if (matches.length > 1) {
     printCandidates(name, matches);
   }
@@ -544,9 +566,8 @@ async function runLauncher(state) {
     console.error(`Resuming session: ${matches[0].path}`);
     piArgs.push("--session", matches[0].path);
   } else {
-    if (!state.global && all.length > local.length) {
-      const elsewhere = all.length - local.length;
-      console.error(`No "${name}" in this cwd. (${elsewhere} match${elsewhere === 1 ? "" : "es"} in other cwds — use --global to consider ${elsewhere === 1 ? "it" : "them"}.)`);
+    if (!state.global) {
+      console.error(`No "${name}" found in this cwd. Use --global to search other cwds.`);
     }
     console.error("Starting new session.");
   }
