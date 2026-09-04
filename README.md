@@ -14,9 +14,10 @@ Questions, ideas? There's a [pi-link thread](https://discord.com/channels/145680
 - [Prerequisites](#prerequisites)
 - [Quick Start](#quick-start)
 - [Walkthrough](#walkthrough)
-- [Configuration](#configuration)
 - [LLM Tools](#llm-tools)
 - [Slash Commands](#slash-commands)
+- [Configuration](#configuration)
+  - [Who is connected right now](#who-is-connected-right-now)
 - [Architecture](#architecture)
 - [Troubleshooting](#troubleshooting)
 - [Limitations & Design Decisions](#limitations--design-decisions)
@@ -135,85 +136,6 @@ In Terminal 1, type a normal prompt:
 ```
 
 Terminal 1 calls `link_send` and returns immediately. The message enters Terminal 2's reasoning — steered into its current run if it is working, or starting a turn if it is idle. Terminal 2 completes the assignment, then sends a conventional `DONE` callback. That callback enters Terminal 1 the same way, where the result can be presented or used for follow-up work.
-
----
-
-## Configuration
-
-Link is **off by default**. Without `--link`, `--link-name`, or `pi-link`, a fresh session is completely silent — no status bar, no connections, no warnings.
-
-**Naming concepts**
-
-- **link name** — identity used on the network (visible in `link_list`, `/link`, and messages).
-- **Pi session name** — identity Pi gives the session itself; lives in the session JSONL's latest `session_info` entry.
-- **saved link name** — the link name persisted to the session, restored on resume. Set by `/link-name`, `pi-link <name>`, or `pi --link-name <name>`.
-- **`--link-name` flag vs `/link-name` command** — same concept (the link name) at different times (startup vs mid-session).
-
-| What you want                        | Use                     |
-| ------------------------------------ | ----------------------- |
-| Resume/create a named session        | `pi-link <name>`        |
-| Stable link identity, normal Pi flow | `pi --link-name <name>` |
-| Quick try, random name               | `pi --link`             |
-| Already in a session                 | `/link-connect`         |
-| Disconnect mid-session               | `/link-disconnect`      |
-
-`pi-link <name>` resumes/creates a session AND sets your link identity in one step. `pi --link-name <name>` sets only the link identity, leaving Pi's normal session selection (latest in cwd, or fresh) untouched.
-
-**Name normalization:** Link names are normalized — leading/trailing whitespace removed and internal whitespace runs collapsed to a single space. `/link-name "build   lead"` saves and shows as `build lead`.
-
-**Name precedence:** `pi --link-name` > `pi-link <name>` > saved `/link-name` > Pi session name > random `t-xxxx`. _(The `pi-link` wrapper itself does not accept `--link-name`; pick one or the other.)_
-
-`/link-connect` and `/link-disconnect` save their intent to the session — resume later and the connection state is restored without needing the flag. Explicit user intent takes precedence over `--link`.
-
-Once connected, terminals discover each other on `127.0.0.1:9900`. See [Limitations](#limitations--design-decisions) for the hardcoded port.
-
-### Session Resume
-
-Pi's `--session` flag requires a file path, not a display name. `pi-link` bridges this — it resolves a session by name and launches Pi directly:
-
-```bash
-pi-link worker-1                # resume or create session "worker-1"
-pi-link worker-1 --model sonnet # with extra Pi flags
-```
-
-How it works: `pi-link worker-1` scans Pi's session directory, finds the session named "worker-1", and spawns `pi --session <path> --link`. Session-dir resolution matches Pi's lookup order: `PI_CODING_AGENT_SESSION_DIR` env > `<cwd>/.pi/settings.json` `sessionDir` > `<agentDir>/settings.json` `sessionDir` > default `<agentDir>/sessions/`. `<agentDir>` follows `PI_CODING_AGENT_DIR` and defaults to `~/.pi/agent/`.
-
-Lookup is **scoped to the current cwd by default**; pass `--global` (`-g`) to consider sessions in any cwd. A scoped lookup stops reading a session file as soon as its header names another cwd, so it never learns the names of sessions belonging to other directories, and its cost tracks this cwd's own history rather than the history of unrelated projects.
-
-- **One match in scope** → resumes that session
-- **No match in scope** → creates a new session in the current cwd, and advises `--global` without claiming a session exists elsewhere.
-- **Multiple matches in scope** → prints candidates to stderr, exits 1
-- **Conflicting flags** (`--session`, `--continue`, `--resume`, `--fork`, etc.) → rejected with an error
-
-### Discovering sessions
-
-`pi-link --list` shows pi-link sessions in the current cwd; `pi-link --list --global` (or `-g`) lists them across all directories. Sorted by last activity — starting a session with the same name it already has does not bump recency; only real activity (messages, tool calls, edits, name changes) does.
-
-```
-$ pi-link --list
-NAME             MODIFIED  MESSAGES  ID
-opus@pi-link     2m ago    4632      6332faab
-gpt@pi-link      5m ago    1493      20d43841
-
-Resume: pi-link <name>
-```
-
-With `--global`:
-
-```
-$ pi-link --list --global
-NAME             CWD                   MODIFIED  MESSAGES  ID
-opus@pi-link     ~/my-project          2m ago    4632      6332faab
-gpt@pi-link      ~/other-project       5m ago    1493      20d43841
-
-Resume: pi-link <name>
-```
-
-`--global` adds a `CWD` column with `~` substituted for `$HOME`. Output is plain when piped (`NO_COLOR` honored).
-
-`pi-link <name>` and `pi-link --resolve <name>` follow the same scoping: local cwd by default, `--global` (or `-g`) widens. A local miss never silently jumps cwds: it says the name was not found here and suggests `--global`. Because a local scan skips sessions from other cwds without reading them, that suggestion is advice rather than a report that a match exists elsewhere - run it with `--global` to find out.
-
-For scripting, `pi-link --resolve <name>` prints just the session path (machine-readable, no other output). Exit codes: `0` on single match, `1` if ambiguous (multiple matches printed to stderr), `2` if not found.
 
 ---
 
@@ -353,6 +275,178 @@ See [Configuration](#configuration) for details on `--link`, `/link-connect`, an
 
 ---
 
+## Configuration
+
+Link is **off by default**. Without `--link`, `--link-name`, or `pi-link`, a fresh session is completely silent — no status bar, no connections, no warnings.
+
+**Naming concepts**
+
+- **link name** — identity used on the network (visible in `link_list`, `/link`, and messages).
+- **Pi session name** — identity Pi gives the session itself; lives in the session JSONL's latest `session_info` entry.
+- **saved link name** — the link name persisted to the session, restored on resume. Set by `/link-name`, `pi-link <name>`, or `pi --link-name <name>`.
+- **`--link-name` flag vs `/link-name` command** — same concept (the link name) at different times (startup vs mid-session).
+
+| What you want                        | Use                     |
+| ------------------------------------ | ----------------------- |
+| Resume/create a named session        | `pi-link <name>`        |
+| Stable link identity, normal Pi flow | `pi --link-name <name>` |
+| Quick try, random name               | `pi --link`             |
+| Already in a session                 | `/link-connect`         |
+| Disconnect mid-session               | `/link-disconnect`      |
+
+`pi-link <name>` resumes/creates a session AND sets your link identity in one step. `pi --link-name <name>` sets only the link identity, leaving Pi's normal session selection (latest in cwd, or fresh) untouched.
+
+**Name normalization:** Link names are normalized — leading/trailing whitespace removed and internal whitespace runs collapsed to a single space. `/link-name "build   lead"` saves and shows as `build lead`.
+
+**Name precedence:** `pi --link-name` > `pi-link <name>` > saved `/link-name` > Pi session name > random `t-xxxx`. _(The `pi-link` wrapper itself does not accept `--link-name`; pick one or the other.)_
+
+`/link-connect` and `/link-disconnect` save their intent to the session — resume later and the connection state is restored without needing the flag. Explicit user intent takes precedence over `--link`.
+
+Once connected, terminals discover each other on `127.0.0.1:9900`. See [Limitations](#limitations--design-decisions) for the hardcoded port.
+
+### Session Resume
+
+Pi's `--session` flag requires a file path, not a display name. `pi-link` bridges this — it resolves a session by name and launches Pi directly:
+
+```bash
+pi-link worker-1                # resume or create session "worker-1"
+pi-link worker-1 --model sonnet # with extra Pi flags
+```
+
+How it works: `pi-link worker-1` scans Pi's session directory, finds the session named "worker-1", and spawns `pi --session <path> --link`. Session-dir resolution matches Pi's lookup order: `PI_CODING_AGENT_SESSION_DIR` env > `<cwd>/.pi/settings.json` `sessionDir` > `<agentDir>/settings.json` `sessionDir` > default `<agentDir>/sessions/`. `<agentDir>` follows `PI_CODING_AGENT_DIR` and defaults to `~/.pi/agent/`.
+
+Lookup is **scoped to the current cwd by default**; pass `--global` (`-g`) to consider sessions in any cwd. A scoped lookup stops reading a session file as soon as its header names another cwd, so it never learns the names of sessions belonging to other directories, and its cost tracks this cwd's own history rather than the history of unrelated projects.
+
+- **One match in scope** → resumes that session
+- **No match in scope** → creates a new session in the current cwd, and advises `--global` without claiming a session exists elsewhere.
+- **Multiple matches in scope** → prints candidates to stderr, exits 1
+- **Conflicting flags** (`--session`, `--continue`, `--resume`, `--fork`, etc.) → rejected with an error
+
+### Discovering sessions
+
+`pi-link --list` shows pi-link sessions in the current cwd; `pi-link --list --global` (or `-g`) lists them across all directories. Sorted by last activity — starting a session with the same name it already has does not bump recency; only real activity (messages, tool calls, edits, name changes) does.
+
+```
+$ pi-link --list
+NAME             MODIFIED  MESSAGES  ID
+opus@pi-link     2m ago    4632      6332faab
+gpt@pi-link      5m ago    1493      20d43841
+
+Resume: pi-link <name>
+```
+
+With `--global`:
+
+```
+$ pi-link --list --global
+NAME             CWD                   MODIFIED  MESSAGES  ID
+opus@pi-link     ~/my-project          2m ago    4632      6332faab
+gpt@pi-link      ~/other-project       5m ago    1493      20d43841
+
+Resume: pi-link <name>
+```
+
+`--global` adds a `CWD` column with `~` substituted for `$HOME`. Output is plain when piped (`NO_COLOR` honored).
+
+`pi-link <name>` and `pi-link --resolve <name>` follow the same scoping: local cwd by default, `--global` (or `-g`) widens. A local miss never silently jumps cwds: it says the name was not found here and suggests `--global`. Because a local scan skips sessions from other cwds without reading them, that suggestion is advice rather than a report that a match exists elsewhere - run it with `--global` to find out.
+
+For scripting, `pi-link --resolve <name>` prints just the session path (machine-readable, no other output). Exit codes: `0` on single match, `1` if ambiguous (multiple matches printed to stderr), `2` if not found.
+
+### Who is connected right now
+
+`--list` and `--status` answer different questions. `--list` reads session files on disk and answers *which sessions exist in history on this machine* — a session that died days ago still appears. `--status` asks the running hub and answers *who is connected to the link at this instant* — it is held in the hub's memory, so it needs a live hub and reports nothing about sessions that are merely saved.
+
+```
+$ pi-link --status
+NAME          STATUS               CONTEXT          CWD
+opus@pi-link  idle (7m)            92K/272K (34%)   ~/my-project
+gpt@pi-link   tool:link_send (3s)  ?/272K           ~/my-project
+new@pi-link   ?                    ?                ?
+sol@pi-link   compacting (12s)     1.3M/2.0M (63%)  ~/other-project
+```
+
+The hub is listed first, then clients sorted by name. A `?` means the hub could not report that field — for `new@pi-link` above, it has registered but has not yet sent its first status update. **`?` means unknown, not idle.** Reading it as idle is the mistake this command exists to prevent.
+
+The word for what this proves is **connected**, not alive: it shows terminals registered with the hub that answered. A terminal whose process is wedged still holds its connection, so `--status` never claims a terminal is healthy — only that it is on the link.
+
+Querying is read-only. It does not register a terminal, does not appear in anyone's `link_list`, and broadcasts nothing to the fleet.
+
+#### Scripting
+
+`--status --json` writes the hub's response body to stdout verbatim, and the endpoint is plain HTTP, so `curl` works too:
+
+```bash
+pi-link --status --json
+curl 127.0.0.1:9900/status
+```
+
+Two of the terminals above, as the hub reports them:
+
+```json
+{
+  "hub": "opus@pi-link",
+  "port": 9900,
+  "terminals": [
+    {
+      "name": "opus@pi-link",
+      "role": "hub",
+      "status": "idle",
+      "sinceSeconds": 420,
+      "cwd": "C:/Users/andre/my-project",
+      "context": { "tokens": 92000, "window": 272000 }
+    },
+    {
+      "name": "new@pi-link",
+      "role": "client",
+      "context": null
+    }
+  ]
+}
+```
+
+| Field | Meaning |
+| --- | --- |
+| `hub` | Name of the hub that answered; always equal to `terminals[0].name` |
+| `port` | Port the hub is bound to |
+| `terminals` | Hub first, then clients sorted by name — never empty |
+| `terminals[].name` | Terminal name as the hub knows it |
+| `terminals[].role` | `hub` for the first entry, `client` for the rest |
+| `terminals[].status` | `idle`, `thinking`, `compacting`, or `tool:<name>` |
+| `terminals[].sinceSeconds` | Whole seconds in that status, rounded — relative, so no clock agreement is needed |
+| `terminals[].cwd` | Working directory; **omitted** when the hub does not know it |
+| `terminals[].context` | **Always present**: `null` when there is no snapshot, otherwise `{ tokens, window }` |
+
+**`status` and `sinceSeconds` are one optional pair — both present or both absent.** They are absent for a terminal the hub has registered but not yet heard from. Absence means unknown; do not substitute a default.
+
+**`context` uses `null`, not omission.** The field is always there; `null` means no snapshot exists, and `{ "tokens": null, "window": 272000 }` means a snapshot exists but the token count is mid-refresh (rendered `?/272K`).
+
+Two things may grow, and consumers must tolerate both:
+
+- **Unknown fields.** Documented fields are frozen; new ones may be added, so ignore what you do not recognize rather than rejecting the payload.
+- **Unknown `status` values.** The vocabulary is not frozen — it has grown before, gaining `compacting` in 0.3.0. Treat any non-empty string as possible; the CLI renders an unrecognized value as-is instead of refusing the response.
+
+#### Exit codes
+
+| Code | Meaning | Message |
+| --- | --- | --- |
+| `0` | The hub answered with a valid payload | — |
+| `2` | No hub answered | `No link hub running on :9900.` |
+| `1` | Usage error, or something answered that is not a compatible hub | `Link hub does not support /status — update pi-link and restart terminals.` |
+
+The two failure messages are deliberately distinct, so a script can tell *the link is down* from *this machine needs upgrading* without parsing anything else. Exit `2` covers both nothing listening and a listener that accepts the request but does not answer within two seconds — every timeout is exit `2`. Exit `1` covers a listener that responds but is not a hub speaking this contract: a pi-link 0.3.0 hub answers plain HTTP with `426 Upgrade Required`, so an out-of-date fleet lands here deterministically rather than looking like an outage.
+
+Exit `2` means no hub answered **at that instant**. When a hub exits, a surviving client promotes itself to replace it, which takes roughly 2–5 seconds — poll again before concluding the fleet is down.
+
+#### Notes
+
+`PI_LINK_PORT` changes only where the CLI looks; the extension always binds the hub to `9900`. It exists so tests can run a stub hub on a free port. The value is not validated — an unusable one simply fails the request and is reported back to you in the exit-`2` message.
+
+The endpoint is bound to `127.0.0.1` with no authentication, the same trust boundary as the WebSocket surface it shares a port with: any process on this machine can already connect to the link.
+
+Finally, `--status` and `--json` belong to the wrapper only until a session name appears. After one, they are pi's: `pi-link mybot --status` forwards `--status` to pi untouched, exactly like any other passthrough flag.
+
+---
+
 ## Architecture
 
 ### Hub-Spoke Topology
@@ -410,6 +504,10 @@ A `link_compact` request does not interrupt work the target is still doing, so i
 ### I sent a message but got no reply
 
 A successful send is not a confirmation. On a client it means the message was handed to the hub connection, not that the target received it or acted on it — and replies are ordinary messages the other agent chooses to send, so nothing produces one automatically. Run `/link`, or ask your model to call `link_list`, and check the target: confirm the name is still exactly right, and note that a target in the `compacting` state holds messages that reach it until that state clears. Otherwise silence may mean the work is still running or that no reply was sent.
+
+### `pi-link --status` reports no hub, or an unsupported one
+
+The two messages mean different things. `No link hub running on :9900.` (exit `2`) means nothing answered — either the link is genuinely down, or you caught it during the 2–5 second window while a client promotes itself to hub, so poll again before believing it. `Link hub does not support /status — update pi-link and restart terminals.` (exit `1`) means something did answer but is not a hub speaking this contract — usually a pi-link 0.3.0 hub, which predates the endpoint. Updating is not enough on its own: the running terminals keep the old hub alive until they restart. See [Who is connected right now](#who-is-connected-right-now).
 
 ### Terminals don't see each other
 

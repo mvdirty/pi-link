@@ -18,6 +18,7 @@ import {
 import { Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import * as crypto from "node:crypto";
+import { createServer, type Server as HttpServer } from "node:http";
 import * as os from "node:os";
 
 import { WebSocket, WebSocketServer } from "ws";
@@ -209,6 +210,9 @@ export default function (pi: ExtensionAPI) {
 
   // Hub state
   let wss: WebSocketServer | null = null;
+  // The hub owns the HTTP server the WS server rides on, because `wss.close()`
+  // never closes a server it was handed. Nulled wherever `wss` is.
+  let hubHttpServer: HttpServer | null = null;
   const hubClients = new Map<WebSocket, string>(); // ws → terminal name
   const hubTerminalStatuses = new Map<string, LinkStatus>(); // hub-authoritative
   const hubTerminalContexts = new Map<string, ContextSnapshot>(); // hub-authoritative
@@ -226,6 +230,7 @@ export default function (pi: ExtensionAPI) {
     promise: Promise<void>;
     socket: WebSocket | null; // dialing, not yet `ws`
     server: WebSocketServer | null; // binding, not yet `wss`
+    httpServer: HttpServer | null; // binding, not yet `hubHttpServer`
   };
   let connectionAttempt: ConnectionAttempt | null = null;
 
@@ -598,6 +603,52 @@ export default function (pi: ExtensionAPI) {
 
   function terminalList(): string[] {
     return Array.from(allTerminalNames()).sort();
+  }
+
+  /**
+   * Hub: the `GET /status` snapshot. Pure reads — it mutates nothing and sends
+   * nothing, so observing the link cannot disturb it.
+   *
+   * Hub entry first, then clients sorted by name, so pollers see a stable order.
+   * `status`/`sinceSeconds` and `cwd` are omitted rather than invented when the
+   * hub has not heard them yet: a client is in `hubClients` from `register`, but
+   * its first `status_update` arrives a round trip later, and reporting a fresh
+   * peer as "idle" would be exactly the false inventory this endpoint exists to
+   * remove.
+   */
+  function buildStatusPayload() {
+    const now = Date.now();
+
+    const describe = (name: string, entryRole: "hub" | "client") => {
+      const status = getStatusFor(name);
+      const cwd = getCwdFor(name);
+      const context = getContextFor(name);
+      return {
+        name,
+        role: entryRole,
+        ...(status
+          ? {
+              status: statusIdentity(status),
+              sinceSeconds: Math.round((now - status.since) / 1000),
+            }
+          : {}),
+        ...(cwd ? { cwd } : {}),
+        context: context
+          ? { tokens: context.tokens, window: context.contextWindow }
+          : null,
+      };
+    };
+
+    return {
+      hub: terminalName,
+      port: DEFAULT_PORT,
+      terminals: [
+        describe(terminalName, "hub"),
+        ...Array.from(hubClients.values())
+          .sort()
+          .map((name) => describe(name, "client")),
+      ],
+    };
   }
 
   function safeParse(data: string): LinkMessage | null {
@@ -975,10 +1026,22 @@ export default function (pi: ExtensionAPI) {
 
   function startHub(attempt: ConnectionAttempt): Promise<boolean> {
     return new Promise((resolve) => {
-      const server = new WebSocketServer({
-        port: DEFAULT_PORT,
-        host: "127.0.0.1",
+      // Owning the HTTP server is what makes `GET /status` possible: a port-bound
+      // `WebSocketServer` builds its own and answers every plain request with 426.
+      // `ws` forwards this server's `listening` and `error`, so the election below
+      // is unchanged.
+      const httpServer = createServer((req, res) => {
+        if (req.method === "GET" && req.url === "/status") {
+          res.writeHead(200, { "content-type": "application/json" });
+          res.end(JSON.stringify(buildStatusPayload()));
+          return;
+        }
+        res.writeHead(404);
+        res.end();
       });
+      attempt.httpServer = httpServer;
+
+      const server = new WebSocketServer({ server: httpServer });
       attempt.server = server;
 
       // The phase settles once. `error` and a pre-listen `close` both report the
@@ -988,16 +1051,19 @@ export default function (pi: ExtensionAPI) {
         if (settled) return;
         settled = true;
         if (attempt.server === server) attempt.server = null;
+        if (attempt.httpServer === httpServer) attempt.httpServer = null;
         resolve(established);
       };
 
       server.on("listening", () => {
         if (!attemptIsCurrent(attempt)) {
           server.close();
+          httpServer.close();
           settle(false);
           return;
         }
         wss = server;
+        hubHttpServer = httpServer;
         // If a client `/link-name` was in flight when the previous hub vanished,
         // this terminal is now establishing hub identity, so honor that pending
         // request. Otherwise keep the last hub-assigned identity — don't replay
@@ -1033,6 +1099,9 @@ export default function (pi: ExtensionAPI) {
         // Reached when a pending server is cancelled; a no-op once established.
         settle(false);
       });
+
+      // Last, so no forwarded event can arrive before its handler exists.
+      httpServer.listen(DEFAULT_PORT, "127.0.0.1");
     });
   }
 
@@ -1128,6 +1197,7 @@ export default function (pi: ExtensionAPI) {
       promise: Promise.resolve(),
       socket: null,
       server: null,
+      httpServer: null,
     };
     connectionAttempt = attempt;
     attempt.promise = runAttempt(attempt);
@@ -1172,8 +1242,13 @@ export default function (pi: ExtensionAPI) {
     const attempt = connectionAttempt;
     if (!attempt) return;
     connectionAttempt = null;
-    attempt.socket?.close();
-    attempt.server?.close();
+    // Read every handle first: closing the WS server can settle the attempt, and
+    // settling clears these fields. Closing the HTTP server is not optional — it
+    // holds the port, so a skipped close squats :9900 for the whole machine.
+    const { socket, server, httpServer } = attempt;
+    socket?.close();
+    server?.close();
+    httpServer?.close();
   }
 
   function scheduleReconnect() {
@@ -1219,6 +1294,8 @@ export default function (pi: ExtensionAPI) {
       hubClients.clear();
       wss.close();
       wss = null;
+      hubHttpServer?.close();
+      hubHttpServer = null;
     }
 
     role = "disconnected";

@@ -6,6 +6,28 @@ This changelog is based on the git history from `2026-03-21` (initial commit) th
 
 ---
 
+## 0.4.0 — 2026-09-04
+
+### Added
+
+- **The hub answers `GET /status` on the port it already owns.** A read-only JSON snapshot of who is connected right now, served over plain HTTP on `127.0.0.1:9900` alongside the WebSocket surface — no authentication, the same trust boundary as the link itself. The hub is listed first, then clients sorted by name. `status` and `sinceSeconds` are one optional pair, present together or absent together: absent means the hub has registered that terminal but not yet heard from it, which is unknown rather than idle. `context` is always present, `null` when there is no snapshot. Every other method and path answers 404. Reading the endpoint registers nothing, broadcasts nothing and changes no hub state, so watching the link no longer disturbs it — previously the only way to see live membership from outside Pi was to open a WebSocket and register, which announced a phantom terminal to the whole fleet.
+
+- **`pi-link --status [--json]` reads that endpoint from the shell.** A table by default; `--json` writes the hub's response body verbatim for scripting. Three exit codes, with the two failures deliberately distinct so automation can tell an outage from a version mismatch without parsing anything: `0` on a valid payload, `2` with `No link hub running on :<port>.` when nothing answers, and `1` with `Link hub does not support /status — update pi-link and restart terminals.` when something answers that is not a hub speaking this contract. Every timeout is exit `2`, including a listener that returns headers and then stalls. A 0.3.0 hub answers plain HTTP with `426 Upgrade Required`, so an out-of-date fleet lands on exit `1` deterministically instead of looking like a dead link. `--status` and `--json` belong to the wrapper only until a session name appears; after one they forward to pi untouched, like any other passthrough flag.
+
+### Changed
+
+- **The hub owns the HTTP server its WebSocket server rides on.** Serving `/status` means handing `ws` a server instead of letting it build one, and `ws` never closes a server it was handed. That server is therefore closed at every teardown site — a cancelled connection attempt, a `/link-disconnect` from an established hub, and a listener that arrives after its attempt was cancelled. A missed close would leave a process squatting `:9900` with no hub behind it, and no other terminal on the machine could become the hub. Election is unchanged: `ws` forwards `listening` and `error` from the provided server, so port-in-use still falls back to the client role exactly as before.
+
+### Compatibility
+
+- **Two things in the `/status` payload may grow, and consumers must tolerate both.** Unknown *fields* may be added, so ignore what you do not recognize rather than rejecting the response. Unknown *`status` values* may appear too — the vocabulary is not frozen, and it has grown before, gaining `compacting` in 0.3.0 — so treat any non-empty string as possible. `pi-link --status` renders an unrecognized status as-is instead of refusing the payload.
+
+- **Upgrading is not enough on its own: restart the terminals.** A running terminal keeps the hub it started with, so a 0.3.0 hub keeps answering `426` until the terminal hosting it restarts. Until then `pi-link --status` reports that the hub does not support `/status`, which is accurate — the fix is a restart, not a reinstall.
+
+- **`PI_LINK_PORT` changes only where the CLI looks.** The extension always binds the hub to `9900`. The variable exists so tests can run a stub hub on a free port, and it is not validated: an unusable value simply fails the request and is reported back in the exit-`2` message.
+
+---
+
 ## 0.3.0 — 2026-08-28
 
 ### Added
